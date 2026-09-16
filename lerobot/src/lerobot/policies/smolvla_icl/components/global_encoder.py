@@ -423,14 +423,22 @@ class GlobalDemoEncoder(nn.Module):
                 "不能使用 SigLIP [-1,1] 输入。"
             )
 
-        # Demo 的时间顺序是 Global 表示的关键语义，因此对每个
-        # batch 样本严格检查所有有效帧的 timestamp 递增。
-        flat_times = timestamps.reshape(timestamps.shape[0], -1)
-        flat_mask = mask.reshape(mask.shape[0], -1)
+        # 允许相邻 clips 重叠，因此不能把 (K,L) 直接展平后要求
+        # timestamp 全局严格递增。正确契约是：每个 clip 内部严格
+        # 递增，且各有效 clip 的时间中心按 clip 顺序严格递增。
         for batch_index in range(timestamps.shape[0]):
-            valid_times = flat_times[batch_index, flat_mask[batch_index]]
-            if len(valid_times) > 1 and torch.any(valid_times[1:] <= valid_times[:-1]):
-                raise ValueError("Demo 的有效 timestamps 必须按 clip/frame 顺序严格递增。")
+            clip_centers: list[Tensor] = []
+            for clip_index in range(timestamps.shape[1]):
+                clip_times = timestamps[batch_index, clip_index][mask[batch_index, clip_index]]
+                if len(clip_times) == 0:
+                    continue
+                if len(clip_times) > 1 and torch.any(clip_times[1:] <= clip_times[:-1]):
+                    raise ValueError("Demo 的有效 timestamp 必须在每个 clip 内严格递增。")
+                clip_centers.append(clip_times.mean())
+            if len(clip_centers) > 1:
+                centers = torch.stack(clip_centers)
+                if torch.any(centers[1:] <= centers[:-1]):
+                    raise ValueError("Demo clips 必须按时间中心严格递增。")
 
     def _compute_clip_phase(self, timestamps: Tensor, valid_mask: Tensor) -> Tensor:
         """计算每个 clip 中心在完整 Demo 内的连续 phase。"""

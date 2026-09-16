@@ -686,10 +686,10 @@ class DemoEmbeddingCache:
         if not 0 <= anchor < self.num_frames:
             raise IndexError("Local Demo 锚点越界。")
 
-        history = self.config.local_history_steps
+        anchor_position = self.config.local_anchor_position
         relative_indices = torch.arange(
-            -history,
-            self.config.local_future_steps,
+            -anchor_position,
+            self.config.local_chunk_size - anchor_position,
             device=self.timestamps.device,
         )
         requested = anchor + relative_indices
@@ -734,7 +734,7 @@ class DemoEmbeddingCache:
             phase=clamped.float() / max(1, self.num_frames - 1),
             valid_mask=local_valid,
             source_indices=source_indices,
-            anchor_position=history,
+            anchor_position=anchor_position,
             demo_anchor_index=anchor,
             alignment_confidence=confidence,
             observation_id=observation_id,

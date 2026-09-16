@@ -1,13 +1,102 @@
-"""SmolVLA-ICL 的轻量配置。
+"""SmolVLA-ICL 的纯配置定义。
 
-当前主体模型仍在搭建，因此本文件只定义已经可独立运行的 Stage Match
-配置。把纯配置与对齐实现分开后，后续 ``SmolVLAICLConfig`` 可以直接持有
-``DemoAlignmentConfig``，而无需从特征处理模块导入类型。
+本文件只放置可序列化的 dataclass，不导入视频骨干、Transformer
+或 Stage Matcher 实现。这样配置可以被 LeRobot/draccus 安全保存，
+也不会因为可选模型依赖导致导入失败。
 """
 
 import math
 from dataclasses import dataclass
 from typing import Any, Self
+
+
+@dataclass
+class GlobalEncoderConfig:
+    """Global Demo Encoder 的结构、输入与训练配置。
+
+    Global Encoder 把一条完整 Demo 编码为固定数量的 Global Task
+    Tokens。输出宽度直接对齐 Demo Expert，因此默认为 SmolVLA
+    VLM hidden size 960 乘以 0.75，即 720。
+
+    ``backbone_name`` 暂时只支持 ``"s3d"``。后续的 MoViNet、
+    VideoMAE 和 Swin3D 会通过相同的 backbone adapter 接口接入，
+    不改变上层 Temporal Aggregator 和 Demo Expert 的数据契约。
+    """
+
+    # 视频骨干。首版只实现 TorchVision S3D。
+    backbone_name: str = "s3d"
+    pretrained_backbone: bool = True
+    freeze_video_backbone: bool = True
+
+    # S3D 接收的单帧空间尺寸。预训练权重会使用自带的
+    # TorchVision transforms；无预训练权重时使用这里的尺寸。
+    image_size: tuple[int, int] = (224, 224)
+    image_mean: tuple[float, float, float] = (0.43216, 0.394666, 0.37645)
+    image_std: tuple[float, float, float] = (0.22803, 0.22145, 0.216989)
+
+    # Processor 将完整 Demo 切分为固定帧数的 clip。首版使用
+    # 16 帧无重叠分段；末尾不足一个 clip 的部分用 valid mask 补齐。
+    clip_length: int = 16
+    clip_stride: int = 16
+
+    # Global State 路径的输入维度对齐 SmolVLA 的 max_state_dim。
+    state_dim: int = 32
+    state_feature_dim: int = 128
+
+    # RGB/State 融合后交给时序 Transformer 的宽度。
+    temporal_hidden_size: int = 512
+    temporal_num_layers: int = 2
+    temporal_num_heads: int = 8
+    temporal_mlp_ratio: float = 4.0
+    temporal_dropout: float = 0.0
+
+    # 固定输出的 Task Query 数量和 Demo Expert hidden size。
+    num_global_tokens: int = 8
+    output_dim: int = 720
+
+    # 一个 clip 至少需要达到该有效帧比例才会交给 Temporal
+    # Aggregator。无效帧会在视频骨干和 State Encoder 前清零。
+    min_valid_frame_fraction: float = 0.5
+    eps: float = 1e-6
+
+    def __post_init__(self) -> None:
+        """验证所有会影响张量形状或数值稳定性的配置。"""
+        if self.backbone_name != "s3d":
+            raise ValueError("当前 Global Encoder 只支持 backbone_name='s3d'。")
+        if len(self.image_size) != 2 or any(size <= 0 for size in self.image_size):
+            raise ValueError("image_size 必须是两个正整数。")
+        if len(self.image_mean) != 3 or len(self.image_std) != 3:
+            raise ValueError("image_mean 和 image_std 必须各包含 3 个通道值。")
+        if any(not math.isfinite(value) for value in (*self.image_mean, *self.image_std)):
+            raise ValueError("图像均值和标准差必须是有限值。")
+        if any(value <= 0 for value in self.image_std):
+            raise ValueError("image_std 的每一维都必须为正数。")
+        if self.clip_length < 14:
+            raise ValueError("S3D 的 clip_length 至少为 14。")
+        if not 1 <= self.clip_stride <= self.clip_length:
+            raise ValueError("clip_stride 必须位于 [1, clip_length]，以保证完整覆盖 Demo。")
+
+        positive_ints = {
+            "state_dim": self.state_dim,
+            "state_feature_dim": self.state_feature_dim,
+            "temporal_hidden_size": self.temporal_hidden_size,
+            "temporal_num_layers": self.temporal_num_layers,
+            "temporal_num_heads": self.temporal_num_heads,
+            "num_global_tokens": self.num_global_tokens,
+            "output_dim": self.output_dim,
+        }
+        if any(value < 1 for value in positive_ints.values()):
+            raise ValueError(f"{', '.join(positive_ints)} 都必须大于 0。")
+        if self.temporal_hidden_size % self.temporal_num_heads != 0:
+            raise ValueError("temporal_hidden_size 必须能被 temporal_num_heads 整除。")
+        if not math.isfinite(self.temporal_mlp_ratio) or self.temporal_mlp_ratio <= 0:
+            raise ValueError("temporal_mlp_ratio 必须是有限正数。")
+        if not math.isfinite(self.temporal_dropout) or not 0 <= self.temporal_dropout < 1:
+            raise ValueError("temporal_dropout 必须位于 [0, 1)。")
+        if not 0 < self.min_valid_frame_fraction <= 1:
+            raise ValueError("min_valid_frame_fraction 必须位于 (0, 1]。")
+        if not math.isfinite(self.eps) or self.eps <= 0:
+            raise ValueError("eps 必须是有限正数。")
 
 
 @dataclass
@@ -55,9 +144,11 @@ class DemoAlignmentConfig:
     dtw_skip_penalty: float = 0.05
     dtw_temperature: float = 0.1
 
-    # 匹配完成后，允许从完整 Demo 中读取锚点之前和之后的内容。
-    local_history_steps: int = 40
-    local_future_steps: int = 60
+    # 匹配完成后，从完整 Demo 中读取固定长度的 Local Chunk。
+    # anchor 在 Local Chunk 中的位置由归一化比例决定：默认 0.4
+    # 表示 anchor 之前保留约 40% 的历史，anchor 及其后内容占约 60%。
+    local_chunk_size: int = 100
+    local_anchor_position_ratio: float = 0.4
     eps: float = 1e-6
 
     @classmethod
@@ -129,8 +220,12 @@ class DemoAlignmentConfig:
         penalties = (self.dtw_stay_penalty, self.dtw_skip_penalty)
         if any(not math.isfinite(penalty) or penalty < 0 for penalty in penalties):
             raise ValueError("DTW penalty 必须是有限非负数。")
-        if self.local_history_steps < 0 or self.local_future_steps < 1:
-            raise ValueError("Local Demo 必须包含锚点，历史长度不能为负数。")
+        if self.local_chunk_size < 1:
+            raise ValueError("local_chunk_size 必须大于 0。")
+        if not math.isfinite(self.local_anchor_position_ratio) or not (
+            0 <= self.local_anchor_position_ratio <= 1
+        ):
+            raise ValueError("local_anchor_position_ratio 必须位于 [0, 1]。")
 
     @property
     def window_size(self) -> int:
@@ -138,9 +233,17 @@ class DemoAlignmentConfig:
         return int(round(self.alignment_hz * self.window_duration_s))
 
     @property
-    def local_chunk_size(self) -> int:
-        """匹配后送给 Demo Expert 的固定 Demo 长度。"""
-        return self.local_history_steps + self.local_future_steps
+    def local_anchor_position(self) -> int:
+        """anchor 在 Local Chunk 内的整数位置。
+
+        使用 ``floor(chunk_size * ratio)`` 将比例映射为序列下标。
+        ratio=1 时将 anchor 放在最后一个位置，确保它始终在
+        Local Chunk 内。
+        """
+        return min(
+            self.local_chunk_size - 1,
+            math.floor(self.local_chunk_size * self.local_anchor_position_ratio),
+        )
 
 
-__all__ = ["DemoAlignmentConfig"]
+__all__ = ["DemoAlignmentConfig", "GlobalEncoderConfig"]
