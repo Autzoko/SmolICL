@@ -23,6 +23,7 @@ from torch.nn import functional as F
 
 from lerobot.lerobot_types import PolicyAction
 from lerobot.processor import PolicyProcessorPipeline
+from lerobot.utils.collate import lerobot_collate_fn
 
 from ..smolvla.processor_smolvla import make_smolvla_pre_post_processors
 from .components.demo_alignment import LocalDemoChunk
@@ -35,11 +36,22 @@ __all__ = [
     "GlobalDemoBatch",
     "GlobalDemoSample",
     "LocalDemoBatch",
+    "SMOLVLA_ICL_GLOBAL_DEMO",
+    "SMOLVLA_ICL_LOCAL_DEMO",
     "build_global_demo_sample",
+    "collate_smolvla_icl_batch",
     "collate_global_demo_samples",
     "collate_local_demo_chunks",
+    "get_smolvla_icl_demo_batches",
     "make_smolvla_icl_pre_post_processors",
 ]
+
+
+# Dataset 单样本中分别保存 GlobalDemoSample 和 LocalDemoChunk；经过下面的
+# policy-specific collate 后，同名字段变成 GlobalDemoBatch 和 LocalDemoBatch。
+# 使用独立命名空间，避免与普通 observation/action feature 冲突。
+SMOLVLA_ICL_GLOBAL_DEMO = "smolvla_icl.global_demo"
+SMOLVLA_ICL_LOCAL_DEMO = "smolvla_icl.local_demo"
 
 
 def make_smolvla_icl_pre_post_processors(
@@ -51,9 +63,10 @@ def make_smolvla_icl_pre_post_processors(
 ]:
     """复用 SmolVLA 的标准输入归一化与输出反归一化管线。
 
-    ICL 新增的完整 Demo 由 :meth:`SmolVLAICLPolicy.set_demo` 单独注册，
-    不应混入逐步 Observation preprocessor。模型输出先在 Policy 中裁剪到
-    真实动作维度，再由这里返回的 postprocessor 恢复到机器人动作尺度。
+    推理时完整 Demo 由 :meth:`SmolVLAICLPolicy.set_demo` 单独注册；训练时
+    Global/Local Demo 作为 complementary data 穿过该 pipeline，不参与普通
+    feature 归一化。模型输出先在 Policy 中裁剪到真实动作维度，再由这里返回的
+    postprocessor 恢复到机器人动作尺度。
     """
     return make_smolvla_pre_post_processors(config, dataset_stats)
 
@@ -147,6 +160,66 @@ class LocalDemoBatch:
             observation_ids=self.observation_ids,
             observation_timestamps=self.observation_timestamps,
         )
+
+
+def collate_smolvla_icl_batch(
+    samples: list[dict[str, Any] | None],
+) -> dict[str, Any] | None:
+    """将标准 LeRobot 样本与配对 Demo 一起组成训练 batch。
+
+    Dataset 的每个有效样本必须额外携带：
+
+    * ``SMOLVLA_ICL_GLOBAL_DEMO``：一条 :class:`GlobalDemoSample`；
+    * ``SMOLVLA_ICL_LOCAL_DEMO``：与当前 Observation 对齐的
+      :class:`LocalDemoChunk`。
+
+    普通 Observation、Action 和语言字段继续交给 LeRobot 原 collate；Demo
+    的变长 clip 和结构化元数据由本模块已有的两个 collate 函数处理。输出仍是
+    单个 ``dict``，因此标准 Trainer 可以保持 ``policy(batch)`` 调用方式。
+    """
+    valid_samples = [sample for sample in samples if sample is not None]
+    if not valid_samples:
+        return None
+
+    for key in (SMOLVLA_ICL_GLOBAL_DEMO, SMOLVLA_ICL_LOCAL_DEMO):
+        if any(key not in sample for sample in valid_samples):
+            raise KeyError(f"SmolVLA-ICL 训练样本缺少必需字段 {key!r}。")
+
+    global_samples = [sample[SMOLVLA_ICL_GLOBAL_DEMO] for sample in valid_samples]
+    local_chunks = [sample[SMOLVLA_ICL_LOCAL_DEMO] for sample in valid_samples]
+    if not all(isinstance(sample, GlobalDemoSample) for sample in global_samples):
+        raise TypeError(f"{SMOLVLA_ICL_GLOBAL_DEMO} 必须保存 GlobalDemoSample。")
+    if not all(isinstance(chunk, LocalDemoChunk) for chunk in local_chunks):
+        raise TypeError(f"{SMOLVLA_ICL_LOCAL_DEMO} 必须保存 LocalDemoChunk。")
+
+    policy_samples = [
+        {
+            key: value
+            for key, value in sample.items()
+            if key not in (SMOLVLA_ICL_GLOBAL_DEMO, SMOLVLA_ICL_LOCAL_DEMO)
+        }
+        for sample in valid_samples
+    ]
+    batch = lerobot_collate_fn(policy_samples)
+    if batch is None:
+        return None
+    batch[SMOLVLA_ICL_GLOBAL_DEMO] = collate_global_demo_samples(global_samples)
+    batch[SMOLVLA_ICL_LOCAL_DEMO] = collate_local_demo_chunks(local_chunks)
+    return batch
+
+
+def get_smolvla_icl_demo_batches(
+    batch: dict[str, Any],
+) -> tuple[GlobalDemoBatch, LocalDemoBatch]:
+    """从标准 Policy batch 中取出已经 collate 的两条 Demo 输入。"""
+    global_demo = batch.get(SMOLVLA_ICL_GLOBAL_DEMO)
+    local_demo = batch.get(SMOLVLA_ICL_LOCAL_DEMO)
+    if not isinstance(global_demo, GlobalDemoBatch) or not isinstance(local_demo, LocalDemoBatch):
+        raise TypeError(
+            "SmolVLA-ICL 训练 batch 必须包含 collate 后的 GlobalDemoBatch 和 "
+            "LocalDemoBatch；请使用 collate_smolvla_icl_batch。"
+        )
+    return global_demo, local_demo
 
 
 def _validate_full_demo_inputs(

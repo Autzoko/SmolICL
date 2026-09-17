@@ -12,16 +12,19 @@ from collections import deque
 from typing import Any
 
 import torch
+from safetensors.torch import load_model as load_model_as_safetensor
 from torch import Tensor, nn
 from torch.nn import functional as F
 
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.device_utils import resolve_safetensors_device
 from lerobot.utils.import_utils import require_package
 
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
 from ..common.vla_utils import create_sinusoidal_pos_embedding, resize_with_pad
 from ..pretrained import PreTrainedPolicy
 from ..smolvla.modeling_smolvla import SmolVLAPolicy, pad_tensor
+from ..utils import log_model_loading_keys
 from .components.demo_alignment import (
     DemoEmbeddingCache,
     ObservationHistoryBuffer,
@@ -38,6 +41,7 @@ from .processor_smolvla_icl import (
     build_global_demo_sample,
     collate_global_demo_samples,
     collate_local_demo_chunks,
+    get_smolvla_icl_demo_batches,
 )
 from .smolvla_with_demo_expert import (
     FourRegionInputs,
@@ -527,6 +531,48 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
     config_class = SmolVLAICLConfig
     name = "smolvla_icl"
 
+    _BASELINE_MISSING_PREFIXES = (
+        "model.global_encoder.",
+        "model.local_encoder.",
+        "model.vlm_with_expert.demo_expert.",
+        "model.vlm_with_expert.prefix_from_global.",
+        "model.vlm_with_expert.action_from_local.",
+    )
+
+    @classmethod
+    def _load_as_safetensor(
+        cls,
+        model: "SmolVLAICLPolicy",
+        model_file: str,
+        map_location: str,
+        strict: bool,
+    ) -> "SmolVLAICLPolicy":
+        """加载 ICL 或 SmolVLA baseline checkpoint，并审计参数键。
+
+        从 baseline 初始化时，只允许 ICL 新模块缺失。任何其他 missing key 或
+        unexpected key 都说明预训练参数路径、层数或 checkpoint 类型没有对齐，
+        不应在 ``strict=False`` 下静默继续训练。
+        """
+        missing_keys, unexpected_keys = load_model_as_safetensor(
+            model,
+            model_file,
+            strict=strict,
+            device=resolve_safetensors_device(map_location),
+        )
+        invalid_missing = [
+            key
+            for key in missing_keys
+            if not key.startswith(cls._BASELINE_MISSING_PREFIXES)
+        ]
+        if invalid_missing or unexpected_keys:
+            raise RuntimeError(
+                "SmolVLA checkpoint 与 SmolVLA-ICL 共享参数路径不一致："
+                f"非预期 missing keys={invalid_missing}，"
+                f"unexpected keys={unexpected_keys}。"
+            )
+        log_model_loading_keys(missing_keys, unexpected_keys)
+        return model
+
     def __init__(
         self,
         config: SmolVLAICLConfig,
@@ -814,14 +860,17 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
 
     def forward(
         self,
-        batch: dict[str, Tensor],
-        global_demo: GlobalDemoBatch,
-        local_demo: LocalDemoBatch,
+        batch: dict[str, Any],
         noise: Tensor | None = None,
         time: Tensor | None = None,
         reduction: str = "mean",
     ) -> tuple[Tensor, dict[str, float]]:
-        """执行训练 forward；训练时 Local Chunk 由数据管线离线提供。"""
+        """执行标准 ``policy(batch)`` 训练入口。
+
+        Global/Local Demo 由 SmolVLA-ICL collate 放在 batch 的专用字段中；
+        Trainer 无需了解结构化 Demo，也不需要额外的位置参数。
+        """
+        global_demo, local_demo = get_smolvla_icl_demo_batches(batch)
         model_device = batch[OBS_STATE].device
         global_demo = global_demo.to(model_device)
         local_demo = local_demo.to(model_device)
@@ -858,4 +907,11 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
                 valid_count = ((~action_is_pad).sum() * losses.shape[-1]).clamp_min(1)
                 loss = losses.sum() / valid_count
             scalar_loss = loss
-        return loss, {"loss": float(scalar_loss.detach())}
+        metrics = {
+            "loss": float(scalar_loss.detach()),
+            **{
+                name: float(value.cpu())
+                for name, value in self.model.vlm_with_expert.demo_gate_statistics().items()
+            },
+        }
+        return loss, metrics

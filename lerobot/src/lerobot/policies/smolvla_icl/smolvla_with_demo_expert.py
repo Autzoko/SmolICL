@@ -348,6 +348,23 @@ class SmolVLMWithDemoExpertModel(SmolVLMWithExpertModel):
         """取得与 VLM 同深度的 Demo Expert layer。"""
         return self.demo_expert.layers[layer_idx]
 
+    def demo_gate_statistics(self) -> dict[str, Tensor]:
+        """返回两类 Demo Cross-Attention gate 的平均绝对值。
+
+        该指标只用于训练日志，便于及时发现 gate 始终接近初始化值、模型可能
+        忽略 Demo 的情况；不参与 loss，也不改变 Attention 计算图。
+        """
+        global_gates = torch.stack(
+            [adapter.gate.detach().float().abs() for adapter in self.prefix_from_global.values()]
+        )
+        local_gates = torch.stack(
+            [adapter.gate.detach().float().abs() for adapter in self.action_from_local.values()]
+        )
+        return {
+            "demo_global_gate_abs_mean": global_gates.mean(),
+            "demo_local_gate_abs_mean": local_gates.mean(),
+        }
+
     def _project_vlm_qkv(self, prefix_hidden: Tensor, layer_idx: int) -> tuple[Tensor, Tensor, Tensor]:
         """使用指定 VLM layer 的原始参数计算 Prefix Q/K/V。"""
         layer = self.get_vlm_model().text_model.layers[layer_idx]
