@@ -1,9 +1,19 @@
 """SmolVLA-ICL policy components。"""
 
-from .configuration_smolvla_icl import DemoAlignmentConfig, GlobalEncoderConfig
-from .components import GlobalDemoEncoder, GlobalEncoderOutput, S3DVideoBackbone
-from .processor_smolvla_icl import (
+from .configuration_smolvla_icl import (
+    DemoAlignmentConfig,
+    GlobalEncoderConfig,
+    LocalEncoderConfig,
+)
+from .components import (
     DemoStateNormalizer,
+    GlobalDemoEncoder,
+    GlobalEncoderOutput,
+    LocalDemoEncoder,
+    LocalEncoderOutput,
+    S3DVideoBackbone,
+)
+from .processor_smolvla_icl import (
     GlobalDemoBatch,
     GlobalDemoSample,
     LocalDemoBatch,
@@ -21,6 +31,9 @@ __all__ = [
     "GlobalEncoderConfig",
     "GlobalEncoderOutput",
     "LocalDemoBatch",
+    "LocalDemoEncoder",
+    "LocalEncoderConfig",
+    "LocalEncoderOutput",
     "S3DVideoBackbone",
     "build_global_demo_sample",
     "collate_global_demo_samples",

@@ -72,9 +72,6 @@ def _sinusoidal_phase_embedding(phase: Tensor, dimension: int) -> Tensor:
     这里使用实际 timestamp 得到的 ``[0, 1]`` phase，而不是简单的
     clip index。因此同一任务以不同帧率记录时，时间位置的语义仍然一致。
     """
-    if dimension < 1:
-        raise ValueError("phase embedding 维度必须大于 0。")
-
     # 使用 float32 计算三角函数，避免 bf16/fp16 在高频区间精度不足。
     phase_fp32 = phase.float()
     half_dim = max(1, dimension // 2)
@@ -91,6 +88,33 @@ def _sinusoidal_phase_embedding(phase: Tensor, dimension: int) -> Tensor:
     if embedding.shape[-1] < dimension:
         embedding = F.pad(embedding, (0, dimension - embedding.shape[-1]))
     return embedding[..., :dimension]
+
+
+def _resample_valid_video_frames(clips: Tensor, valid_mask: Tensor) -> Tensor:
+    """把每个部分有效的 clip 用自身有效帧简单补满。
+
+    S3D 的 3D 卷积不能直接消费 frame mask。若只把 padding 置零，卷积和
+    最终池化仍会混合真实帧与 padding。这里按时间顺序把有效帧最近邻重采样
+    到原 clip 长度，使送入 S3D 的非空 clip 不再包含人工零帧。
+    """
+    num_frames = clips.shape[1]
+    dense_clips: list[Tensor] = []
+    for clip, mask in zip(clips, valid_mask, strict=True):
+        valid_frames = clip[mask]
+        if len(valid_frames) == 0:
+            dense_clips.append(torch.zeros_like(clip))
+            continue
+        if len(valid_frames) == num_frames:
+            dense_clips.append(clip)
+            continue
+        indices = torch.linspace(
+            0,
+            len(valid_frames) - 1,
+            steps=num_frames,
+            device=clips.device,
+        ).round().long()
+        dense_clips.append(valid_frames.index_select(0, indices))
+    return torch.stack(dense_clips)
 
 
 class S3DVideoBackbone(nn.Module):
@@ -173,11 +197,10 @@ class S3DVideoBackbone(nn.Module):
             )
 
         mask = frame_valid_mask.to(device=clips.device, dtype=torch.bool)
-        safe_clips = torch.where(
-            mask[:, :, None, None, None],
-            clips,
-            torch.zeros_like(clips),
-        )
+        # S3D 内部没有 frame-level mask，因此在进入 3D 卷积前将每个
+        # 部分有效 clip 用自身的有效帧补满，而不是向视频中混入零帧。
+        safe_clips = _resample_valid_video_frames(clips, mask)
+        clip_valid = mask.any(dim=1)
 
         if self.preprocess is not None:
             # TorchVision 预训练 transform 接收 (...,T,C,H,W)，输出
@@ -186,23 +209,14 @@ class S3DVideoBackbone(nn.Module):
         else:
             video = self._preprocess_without_weights(safe_clips)
 
-        if video.ndim != 5 or video.shape[:3] != (
-            clips.shape[0],
-            clips.shape[2],
-            clips.shape[1],
-        ):
-            raise RuntimeError("S3D 预处理后的视频形状不符合 (N,C,T,H,W)。")
-
-        # 黑色 padding 帧经 normalize 后不再是 0，因此必须在预处理
-        # 之后再次施加 frame mask，防止 padding 进入 3D 卷积。
-        video = video * mask[:, None, :, None, None].to(video.dtype)
-        feature_parameter = next(self.features.parameters())
-        video = video.to(dtype=feature_parameter.dtype)
+        # 全空 clip 经 normalize 后也可能不为零，因此在预处理后清零；
+        # 部分有效 clip 已经在上方重采样为稠密视频，不再施加原始 mask。
+        video = video * clip_valid[:, None, None, None, None].to(video.dtype)
+        video = video.to(dtype=next(self.features.parameters()).dtype)
         features = self.features(video)
         pooled = F.adaptive_avg_pool3d(features, output_size=1).flatten(1)
 
         # 全 padding clip 即使经过带 bias 的卷积也必须输出严格的零。
-        clip_valid = mask.any(dim=1)
         return torch.where(clip_valid[:, None], pooled, torch.zeros_like(pooled))
 
 
@@ -217,7 +231,6 @@ class _MaskedStateEncoder(nn.Module):
 
     def __init__(self, state_dim: int, output_dim: int, eps: float) -> None:
         super().__init__()
-        self.state_dim = state_dim
         self.eps = eps
         self.frame_mlp = nn.Sequential(
             nn.Linear(state_dim * 2, output_dim),
@@ -233,21 +246,13 @@ class _MaskedStateEncoder(nn.Module):
 
     def forward(self, states: Tensor, timestamps: Tensor, valid_mask: Tensor) -> Tensor:
         """返回 ``(N,D_state)`` clip-level State 特征。"""
-        if states.ndim != 3 or states.shape[-1] != self.state_dim:
-            raise ValueError(
-                f"State Encoder 需要 (N,T,{self.state_dim})，实际为 {tuple(states.shape)}。"
-            )
-        if timestamps.shape != states.shape[:2] or valid_mask.shape != states.shape[:2]:
-            raise ValueError("State timestamps/valid_mask 必须与 states 的 (N,T) 一致。")
-
         mask = valid_mask.to(device=states.device, dtype=torch.bool)
         values = torch.where(mask.unsqueeze(-1), states, torch.zeros_like(states))
-        safe_times = torch.where(mask, timestamps, torch.zeros_like(timestamps))
 
         velocity = torch.zeros_like(values)
         if states.shape[1] > 1:
             pair_valid = mask[:, 1:] & mask[:, :-1]
-            delta_t = safe_times[:, 1:] - safe_times[:, :-1]
+            delta_t = timestamps[:, 1:] - timestamps[:, :-1]
             safe_delta_t = torch.where(
                 pair_valid,
                 delta_t.clamp_min(self.eps),
@@ -268,14 +273,11 @@ class _MaskedStateEncoder(nn.Module):
         valid_count = mask.sum(dim=1, keepdim=True)
         masked_mean = frame_hidden.sum(dim=1) / valid_count.clamp_min(1).to(frame_hidden.dtype)
 
-        positions = torch.arange(states.shape[1], device=states.device).unsqueeze(0)
-        first_position = torch.where(mask, positions, states.shape[1]).min(dim=1).values
-        last_position = torch.where(mask, positions, -torch.ones_like(positions)).max(dim=1).values
-        safe_first = first_position.clamp(0, states.shape[1] - 1)
-        safe_last = last_position.clamp(0, states.shape[1] - 1)
+        first_position = mask.long().argmax(dim=1)
+        last_position = states.shape[1] - 1 - torch.flip(mask, dims=(1,)).long().argmax(dim=1)
         rows = torch.arange(states.shape[0], device=states.device)
-        first_hidden = frame_hidden[rows, safe_first]
-        last_hidden = frame_hidden[rows, safe_last]
+        first_hidden = frame_hidden[rows, first_position]
+        last_hidden = frame_hidden[rows, last_position]
 
         clip_hidden = self.clip_projection(
             torch.cat([masked_mean, last_hidden, last_hidden - first_hidden], dim=-1)
@@ -304,7 +306,6 @@ class GlobalDemoEncoder(nn.Module):
         config: GlobalEncoderConfig | None = None,
         *,
         video_backbone: nn.Module | None = None,
-        video_feature_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.config = config or GlobalEncoderConfig()
@@ -315,8 +316,6 @@ class GlobalDemoEncoder(nn.Module):
         else:
             self.video_backbone = video_backbone
             inferred_video_dim = getattr(video_backbone, "output_dim", None)
-            if video_feature_dim is not None:
-                inferred_video_dim = video_feature_dim
             if inferred_video_dim is None or int(inferred_video_dim) < 1:
                 raise ValueError("自定义 video_backbone 必须提供有效的 output_dim。")
         self.video_feature_dim = int(inferred_video_dim)
@@ -389,73 +388,33 @@ class GlobalDemoEncoder(nn.Module):
         timestamps: Tensor,
         valid_mask: Tensor,
     ) -> None:
-        """在进入高成本视频骨干前拒绝错误形状或非法数值。"""
+        """检查核心形状；数值范围和时间顺序由 Processor 保证。"""
         if video.ndim != 6 or video.shape[3] != 3 or not video.is_floating_point():
             raise ValueError("Global video 必须是浮点 (B,K,L,3,H,W) Tensor。")
-        if states.ndim != 4 or states.shape[:3] != video.shape[:3]:
-            raise ValueError("Global states 必须是与 video 时间维对齐的 (B,K,L,Ds)。")
-        if states.shape[-1] != self.config.state_dim:
+        if states.shape != (*video.shape[:3], self.config.state_dim) or not states.is_floating_point():
             raise ValueError(
-                f"Global states 最后一维必须是 {self.config.state_dim}，"
-                f"实际为 {states.shape[-1]}。"
+                "Global states 必须为浮点 "
+                f"(B,K,L,{self.config.state_dim}) Tensor。"
             )
-        if not states.is_floating_point():
-            raise ValueError("Global states 必须是浮点 Tensor。")
         if timestamps.shape != video.shape[:3] or valid_mask.shape != video.shape[:3]:
             raise ValueError("timestamps/valid_mask 必须与 video 的 (B,K,L) 一致。")
-        if video.shape[0] == 0 or video.shape[1] == 0 or video.shape[2] == 0:
+        if not all(video.shape[:3]):
             raise ValueError("Global Demo 的 batch、clip 数和每 clip 帧数都必须大于 0。")
 
-        mask = valid_mask.to(device=video.device, dtype=torch.bool)
-        if torch.any(mask.flatten(1).sum(dim=1) == 0):
+        if torch.any(~valid_mask.flatten(1).any(dim=1)):
             raise ValueError("每条 Demo 至少需要一帧有效 RGB+State Observation。")
-        if torch.any(~torch.isfinite(video[mask])):
-            raise ValueError("有效 Demo RGB 必须只包含有限值。")
-        if torch.any(~torch.isfinite(states[mask])):
-            raise ValueError("有效 Demo State 必须只包含有限值。")
-        if torch.any(~torch.isfinite(timestamps[mask])):
-            raise ValueError("有效 Demo timestamp 必须只包含有限值。")
-
-        valid_pixels = video[mask]
-        if torch.any(valid_pixels < 0) or torch.any(valid_pixels > 1):
-            raise ValueError(
-                "Global video 必须保持原始 [0,1] 值域，"
-                "不能使用 SigLIP [-1,1] 输入。"
-            )
-
-        # 允许相邻 clips 重叠，因此不能把 (K,L) 直接展平后要求
-        # timestamp 全局严格递增。正确契约是：每个 clip 内部严格
-        # 递增，且各有效 clip 的时间中心按 clip 顺序严格递增。
-        for batch_index in range(timestamps.shape[0]):
-            clip_centers: list[Tensor] = []
-            for clip_index in range(timestamps.shape[1]):
-                clip_times = timestamps[batch_index, clip_index][mask[batch_index, clip_index]]
-                if len(clip_times) == 0:
-                    continue
-                if len(clip_times) > 1 and torch.any(clip_times[1:] <= clip_times[:-1]):
-                    raise ValueError("Demo 的有效 timestamp 必须在每个 clip 内严格递增。")
-                clip_centers.append(clip_times.mean())
-            if len(clip_centers) > 1:
-                centers = torch.stack(clip_centers)
-                if torch.any(centers[1:] <= centers[:-1]):
-                    raise ValueError("Demo clips 必须按时间中心严格递增。")
 
     def _compute_clip_phase(self, timestamps: Tensor, valid_mask: Tensor) -> Tensor:
         """计算每个 clip 中心在完整 Demo 内的连续 phase。"""
-        batch_size, num_clips, frames_per_clip = timestamps.shape
         mask = valid_mask.to(dtype=torch.bool)
         safe_times = torch.where(mask, timestamps, torch.zeros_like(timestamps))
         clip_count = mask.sum(dim=-1)
         clip_center = safe_times.sum(dim=-1) / clip_count.clamp_min(1).to(safe_times.dtype)
 
-        flat_times = timestamps.reshape(batch_size, num_clips * frames_per_clip)
-        flat_mask = mask.reshape(batch_size, num_clips * frames_per_clip)
-        positions = torch.arange(flat_times.shape[1], device=timestamps.device).unsqueeze(0)
-        first_position = torch.where(flat_mask, positions, flat_times.shape[1]).min(dim=1).values
-        last_position = torch.where(flat_mask, positions, -torch.ones_like(positions)).max(dim=1).values
-        rows = torch.arange(batch_size, device=timestamps.device)
-        start_time = flat_times[rows, first_position]
-        end_time = flat_times[rows, last_position]
+        flat_times = timestamps.flatten(1)
+        flat_mask = mask.flatten(1)
+        start_time = torch.where(flat_mask, flat_times, torch.inf).amin(dim=1)
+        end_time = torch.where(flat_mask, flat_times, -torch.inf).amax(dim=1)
         duration = (end_time - start_time).clamp_min(self.config.eps)
         phase = (clip_center - start_time[:, None]) / duration[:, None]
         phase = phase.clamp(0.0, 1.0)
@@ -525,13 +484,13 @@ class GlobalDemoEncoder(nn.Module):
 
         task_queries = self.task_queries.to(dtype=clip_input.dtype).expand(batch_size, -1, -1)
         temporal_input = torch.cat([task_queries, clip_input], dim=1)
-        query_mask = torch.ones(
+        global_mask = torch.ones(
             batch_size,
             self.config.num_global_tokens,
             dtype=torch.bool,
             device=video.device,
         )
-        temporal_valid = torch.cat([query_mask, clip_mask], dim=1)
+        temporal_valid = torch.cat([global_mask, clip_mask], dim=1)
 
         # TransformerEncoder 的 padding mask 语义与项目其他 valid mask 相反：
         # True 表示忽略该 Key，因此这里取反。
@@ -544,12 +503,6 @@ class GlobalDemoEncoder(nn.Module):
         clip_output = clip_output * clip_mask.unsqueeze(-1).to(clip_output.dtype)
 
         global_tokens = self.output_projection(task_output)
-        global_mask = torch.ones(
-            batch_size,
-            self.config.num_global_tokens,
-            dtype=torch.bool,
-            device=video.device,
-        )
         return GlobalEncoderOutput(
             global_tokens=global_tokens,
             global_mask=global_mask,

@@ -25,6 +25,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from ..configuration_smolvla_icl import DemoAlignmentConfig
+from .state_normalizer import DemoStateNormalizer, StateNormalizationSignature
 
 
 __all__ = [
@@ -54,6 +55,7 @@ class AlignmentChunkEmbedding:
     timestamp: float
     valid: bool
     valid_fraction: float
+    state_normalization_signature: StateNormalizationSignature
     observation_id: int | str | None = None
 
 
@@ -483,6 +485,7 @@ class DemoEmbeddingCache:
     """在 rollout 前一次性构建的完整 Demo 缓存。"""
 
     config: DemoAlignmentConfig
+    state_normalizer: DemoStateNormalizer
     timestamps: Tensor
     valid_mask: Tensor
     anchor_indices: Tensor
@@ -501,16 +504,17 @@ class DemoEmbeddingCache:
         cls,
         siglip: SmolVLASigLIPHandle,
         preprocessed_images: Tensor,
-        states: Tensor,
+        raw_states: Tensor,
         timestamps: Tensor,
         *,
+        state_normalizer: DemoStateNormalizer,
         config: DemoAlignmentConfig | None = None,
         valid_mask: Tensor | None = None,
     ) -> Self:
-        """用共享 SigLIP 编码完整 Demo，再构建检索缓存。"""
+        """用共享 SigLIP 编码完整 Demo，并在内部归一化 raw State。"""
         cfg = config or DemoAlignmentConfig()
         siglip._validate_images(preprocessed_images)
-        if len(states) != len(preprocessed_images) or len(timestamps) != len(preprocessed_images):
+        if len(raw_states) != len(preprocessed_images) or len(timestamps) != len(preprocessed_images):
             raise ValueError("Demo image/state/timestamp 的时间长度必须一致。")
 
         cache_device = torch.device(cfg.cache_device)
@@ -520,10 +524,13 @@ class DemoEmbeddingCache:
             tokens = siglip.encode_visual_tokens(
                 preprocessed_images[start : start + cfg.demo_encode_batch_size]
             )
+            # Matcher 使用未归一化的 pooled feature 构建检索特征，
+            # 所需的 L2 归一化稍后单独执行。Local Encoder 则读取下方
+            # 缓存的完整空间 tokens；两条路径共享同一次视觉前向。
             frame_batches.append(
                 pool_visual_tokens(
                     tokens,
-                    normalize=cfg.normalize_visual_features,
+                    normalize=False,
                     eps=cfg.eps,
                 ).to(cache_device)
             )
@@ -534,8 +541,9 @@ class DemoEmbeddingCache:
 
         return cls.from_embeddings(
             torch.cat(frame_batches),
-            states,
+            raw_states,
             timestamps,
+            state_normalizer=state_normalizer,
             config=cfg,
             valid_mask=valid_mask,
             visual_tokens=torch.cat(token_batches) if token_batches else None,
@@ -545,9 +553,10 @@ class DemoEmbeddingCache:
     def from_embeddings(
         cls,
         visual_frame_embeddings: Tensor,
-        states: Tensor,
+        raw_states: Tensor,
         timestamps: Tensor,
         *,
+        state_normalizer: DemoStateNormalizer,
         config: DemoAlignmentConfig | None = None,
         valid_mask: Tensor | None = None,
         visual_tokens: Tensor | None = None,
@@ -555,13 +564,14 @@ class DemoEmbeddingCache:
         """从已经分批编码好的帧特征构建缓存。
 
         该入口适合长视频和测试工具：视觉编码可以流式进行，同时正式代码
-        不再需要调用私有的窗口 helper。
+        不再需要调用私有的窗口 helper。``raw_states`` 必须保持数据集真实
+        State 宽度且尚未归一化；本函数使用显式传入的 normalizer 统一处理。
         """
         cfg = config or DemoAlignmentConfig()
-        if visual_frame_embeddings.ndim != 2 or states.ndim != 2 or timestamps.ndim != 1:
+        if visual_frame_embeddings.ndim != 2 or raw_states.ndim != 2 or timestamps.ndim != 1:
             raise ValueError("Demo visual/state/timestamp 形状必须分别为 (T,Dv)/(T,Ds)/(T,)。")
         num_frames = len(timestamps)
-        if num_frames == 0 or len(visual_frame_embeddings) != num_frames or len(states) != num_frames:
+        if num_frames == 0 or len(visual_frame_embeddings) != num_frames or len(raw_states) != num_frames:
             raise ValueError("Demo 三种输入必须非空且时间长度一致。")
         if visual_tokens is not None:
             if visual_tokens.ndim != 3 or len(visual_tokens) != num_frames:
@@ -569,10 +579,7 @@ class DemoEmbeddingCache:
 
         device = torch.device(cfg.cache_device)
         times = timestamps.detach().to(device=device, dtype=torch.float64)
-        state_values = states.detach().to(device=device, dtype=torch.float32)
         visual_values = visual_frame_embeddings.detach().to(device=device, dtype=torch.float32)
-        if cfg.normalize_visual_features:
-            visual_values = F.normalize(visual_values, dim=-1, eps=cfg.eps)
         frame_valid = (
             torch.ones(num_frames, dtype=torch.bool, device=device)
             if valid_mask is None
@@ -582,6 +589,12 @@ class DemoEmbeddingCache:
             raise ValueError("valid_mask 必须与 Demo 帧数一致。")
         if torch.any(~torch.isfinite(visual_values[frame_valid])):
             raise ValueError("有效 Demo 帧的视觉特征必须只包含有限值。")
+
+        # Matcher 的公开入口只接收真实维度的 raw State，并在内部统一归一化。
+        # 这样已 padding 到 32 维的 State 会在这里直接失败，而 Demo/Query
+        # 也不再依赖调用者分别执行同一套预处理。
+        raw_state_values = raw_states.detach().to(device=device, dtype=torch.float32)
+        state_values = state_normalizer.normalize(raw_state_values, valid_mask=frame_valid)
 
         visual_values = torch.where(
             frame_valid.unsqueeze(-1),
@@ -602,6 +615,10 @@ class DemoEmbeddingCache:
         alignment_valid = frame_valid[alignment_indices]
         alignment_states = state_values[alignment_indices]
         alignment_visual = visual_values[alignment_indices]
+        if cfg.normalize_visual_features:
+            # 检索使用单位向量，Local Encoder 继续使用上面保留的
+            # 原始 pooled feature，避免模型输入被 Matcher 的距离度量绑定。
+            alignment_visual = F.normalize(alignment_visual, dim=-1, eps=cfg.eps)
         matching_state_features = extract_matching_state_features(
             alignment_states,
             alignment_times,
@@ -636,6 +653,7 @@ class DemoEmbeddingCache:
 
         return cls(
             config=cfg,
+            state_normalizer=state_normalizer,
             timestamps=times,
             valid_mask=frame_valid,
             anchor_indices=alignment_indices,
@@ -657,6 +675,13 @@ class DemoEmbeddingCache:
     def num_chunks(self) -> int:
         return len(self.visual_chunk_embeddings)
 
+    def timestamps_to_phase(self, timestamps: Tensor) -> Tensor:
+        """按完整 Demo 的有效时间范围把 timestamp 映射到 ``[0,1]``。"""
+        valid_times = self.timestamps[self.valid_mask]
+        start_time = valid_times.min()
+        duration = (valid_times.max() - start_time).clamp_min(self.config.eps)
+        return ((timestamps - start_time) / duration).clamp(0.0, 1.0)
+
     def get_chunk(self, index: int) -> AlignmentChunkEmbedding:
         """返回指定 Demo 锚点的检索特征。"""
         if not 0 <= index < self.num_chunks:
@@ -669,6 +694,7 @@ class DemoEmbeddingCache:
             timestamp=float(self.timestamps[anchor]),
             valid=bool(self.chunk_valid_mask[index]),
             valid_fraction=float(self.chunk_valid_fraction[index]),
+            state_normalization_signature=self.state_normalizer.signature,
         )
 
     def extract_local_chunk(self, alignment: AlignmentResult | int) -> LocalDemoChunk:
@@ -731,7 +757,7 @@ class DemoEmbeddingCache:
             timestamps=local_timestamps,
             relative_time_s=relative_time,
             relative_position=relative_indices.float() / self.config.local_chunk_size,
-            phase=clamped.float() / max(1, self.num_frames - 1),
+            phase=self.timestamps_to_phase(local_timestamps),
             valid_mask=local_valid,
             source_indices=source_indices,
             anchor_position=anchor_position,
@@ -778,9 +804,11 @@ class ObservationHistoryBuffer:
         self,
         config: DemoAlignmentConfig | None = None,
         *,
+        state_normalizer: DemoStateNormalizer,
         device: torch.device | str | None = None,
     ) -> None:
         self.config = config or DemoAlignmentConfig()
+        self.state_normalizer = state_normalizer
         self.device = torch.device(device or self.config.cache_device)
         self._max_storage = self.config.window_size + 1
         self.reset()
@@ -810,14 +838,14 @@ class ObservationHistoryBuffer:
     def append(
         self,
         *,
-        state: Tensor,
+        raw_state: Tensor,
         timestamp: float | Tensor,
         visual_tokens: Tensor | None = None,
         visual_embedding: Tensor | None = None,
         observation_id: int | str | None = None,
         valid: bool = True,
     ) -> None:
-        """只追加当前已经观测到的一帧；视觉 tokens 和池化特征二选一。"""
+        """追加一帧 raw State 和视觉特征，并在内部执行共享归一化。"""
         frame_valid = bool(valid)
         if (visual_tokens is None) == (visual_embedding is None):
             raise ValueError("visual_tokens 和 visual_embedding 必须且只能提供一个。")
@@ -847,14 +875,16 @@ class ObservationHistoryBuffer:
             if self.config.normalize_visual_features:
                 visual = F.normalize(visual, dim=-1, eps=self.config.eps)
 
-        if state.ndim == 2:
-            if state.shape[0] != 1:
+        if raw_state.ndim == 2:
+            if raw_state.shape[0] != 1:
                 raise ValueError("History Buffer 每次只能追加一个环境的一帧。")
-            state = state[0]
-        if state.ndim != 1 or not state.is_floating_point():
-            raise ValueError("state 必须是单帧浮点特征。")
-        if state.numel() == 0:
-            raise ValueError("state 特征维度必须大于 0。")
+            raw_state = raw_state[0]
+        if raw_state.ndim != 1 or not raw_state.is_floating_point():
+            raise ValueError("raw_state 必须是单帧浮点 State。")
+        state = self.state_normalizer.normalize(
+            raw_state,
+            valid_mask=torch.tensor(frame_valid, device=raw_state.device),
+        )
 
         if self._visual_dim is None:
             self._visual_dim = int(visual.shape[0])
@@ -930,6 +960,7 @@ class ObservationHistoryBuffer:
             timestamp=times_all[-1],
             valid=bool(visual_valid[-1] & state_valid[-1]),
             valid_fraction=float(torch.minimum(visual_fraction[-1], state_fraction[-1])),
+            state_normalization_signature=self.state_normalizer.signature,
             observation_id=self._ids[-1],
         )
 
@@ -983,6 +1014,18 @@ class OnlineDTWMatcher:
     def last_result(self) -> AlignmentResult | None:
         return self._last_result
 
+    def create_observation_history(
+        self,
+        *,
+        device: torch.device | str | None = None,
+    ) -> ObservationHistoryBuffer:
+        """创建与 Demo 强制共享 State 统计量的 Query 历史缓存。"""
+        return ObservationHistoryBuffer(
+            self.config,
+            state_normalizer=self.demo_cache.state_normalizer,
+            device=device,
+        )
+
     def reset(self, *, start_index: int | None = None) -> None:
         """从第一个有效 Demo Chunk（或显式锚点）开始新 Query episode。"""
         valid_indices = torch.nonzero(self.demo_cache.chunk_valid_mask).flatten()
@@ -1007,6 +1050,12 @@ class OnlineDTWMatcher:
         """用最新因果 Query Chunk 推进一次 DTW。"""
         if not query.valid:
             raise ValueError("Query Chunk 尚未积累足够有效帧。")
+        if (
+            not self.config.rgb_only
+            and query.state_normalization_signature
+            != self.demo_cache.state_normalizer.signature
+        ):
+            raise ValueError("Query 与 Demo 必须使用同一套 State 归一化统计量。")
 
         search_start = self._active_index
         search_end = min(
@@ -1051,7 +1100,11 @@ class OnlineDTWMatcher:
             demo_chunk_index=best_index,
             demo_observation_index=demo_index,
             demo_timestamp=float(self.demo_cache.timestamps[demo_index]),
-            phase=demo_index / max(1, self.demo_cache.num_frames - 1),
+            phase=float(
+                self.demo_cache.timestamps_to_phase(
+                    self.demo_cache.timestamps[demo_index]
+                )
+            ),
             confidence=confidence,
             local_cost=float(local_costs[best_offset]),
             accumulated_cost=accumulated_cost,

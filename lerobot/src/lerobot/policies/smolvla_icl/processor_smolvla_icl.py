@@ -14,17 +14,15 @@ Matcher 负责“选哪一段”，Processor 只负责“归一化、补齐和�
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Any, Self, Sequence
+from typing import Self, Sequence
 
 import torch
 from torch import Tensor
 from torch.nn import functional as F
 
-from lerobot.utils.constants import OBS_STATE
-
 from .components.demo_alignment import LocalDemoChunk
+from .components.state_normalizer import DemoStateNormalizer
 from .configuration_smolvla_icl import GlobalEncoderConfig
 
 
@@ -37,111 +35,6 @@ __all__ = [
     "collate_global_demo_samples",
     "collate_local_demo_chunks",
 ]
-
-
-@dataclass(frozen=True, slots=True)
-class DemoStateNormalizer:
-    """用 SmolVLA 训练集统计量归一化 Demo State。
-
-    SmolVLA 对 State 默认使用 ``MEAN_STD``：
-
-    ``normalized = (state - mean) / (std + eps)``。
-
-    ``mean`` 和 ``std`` 只覆盖机器人的真实 State 维度。归一化完成后
-    再在最后一维右侧补 0，避免 padding 维度被 ``(0-mean)/std``
-    变成非零值。
-    """
-
-    mean: Tensor
-    std: Tensor
-    eps: float = 1e-8
-
-    def __post_init__(self) -> None:
-        mean = torch.as_tensor(self.mean).detach().flatten().float().clone()
-        std = torch.as_tensor(self.std).detach().flatten().float().clone()
-        if mean.numel() == 0 or mean.shape != std.shape:
-            raise ValueError("State mean/std 必须是形状相同的非空一维张量。")
-        if torch.any(~torch.isfinite(mean)) or torch.any(~torch.isfinite(std)):
-            raise ValueError("State mean/std 必须只包含有限值。")
-        if torch.any(std < 0):
-            raise ValueError("State std 不能包含负数。")
-        if not math.isfinite(self.eps) or self.eps <= 0:
-            raise ValueError("State normalization eps 必须是有限正数。")
-
-        # frozen dataclass 仍需要把统计量规范为独立 float32 Tensor。
-        object.__setattr__(self, "mean", mean)
-        object.__setattr__(self, "std", std)
-
-    @classmethod
-    def from_dataset_stats(
-        cls,
-        dataset_stats: dict[str, dict[str, Any]],
-        *,
-        state_key: str = OBS_STATE,
-        eps: float = 1e-8,
-    ) -> Self:
-        """从 LeRobot ``dataset_stats`` 读取 Current/Demo 共享的 State 统计量。"""
-        if state_key not in dataset_stats:
-            raise KeyError(f"dataset_stats 中缺少 State key: {state_key!r}。")
-        stats = dataset_stats[state_key]
-        if "mean" not in stats or "std" not in stats:
-            raise KeyError(f"dataset_stats[{state_key!r}] 必须同时包含 mean 和 std。")
-        return cls(mean=torch.as_tensor(stats["mean"]), std=torch.as_tensor(stats["std"]), eps=eps)
-
-    @property
-    def state_dim(self) -> int:
-        """返回统计量覆盖的真实 State 维度。"""
-        return int(self.mean.numel())
-
-    def normalize(
-        self,
-        states: Tensor,
-        *,
-        valid_mask: Tensor | None = None,
-    ) -> Tensor:
-        """归一化 ``(...,D_raw)`` State，保留真实维度并清零无效项。
-
-        Stage Matcher 必须使用该输出，而不是已补到 32 维的 State。
-        否则 ``matching_state_excluded_indices=(-1,)`` 会排除 padding 维，
-        而不是真实 State 的最后一维夹爪。
-        """
-        if states.ndim < 1 or not states.is_floating_point():
-            raise ValueError("states 必须是至少一维的浮点 Tensor。")
-        if states.shape[-1] != self.state_dim:
-            raise ValueError(
-                f"states 最后一维必须与统计量一致：期望 {self.state_dim}，"
-                f"实际 {states.shape[-1]}。"
-            )
-        mask = (
-            torch.ones(states.shape[:-1], dtype=torch.bool, device=states.device)
-            if valid_mask is None
-            else valid_mask.to(device=states.device, dtype=torch.bool)
-        )
-        if mask.shape != states.shape[:-1]:
-            raise ValueError("State valid_mask 必须与 states 除最后一维外的形状一致。")
-        if torch.any(~torch.isfinite(states[mask])):
-            raise ValueError("有效 State 必须只包含有限值。")
-
-        mean = self.mean.to(device=states.device, dtype=states.dtype)
-        std = self.std.to(device=states.device, dtype=states.dtype)
-        normalized = (states - mean) / (std + self.eps)
-        # 无效位置可能含 NaN，必须用 where 显式替换。
-        return torch.where(mask.unsqueeze(-1), normalized, torch.zeros_like(normalized))
-
-    def normalize_and_pad(
-        self,
-        states: Tensor,
-        *,
-        target_dim: int,
-        valid_mask: Tensor | None = None,
-    ) -> Tensor:
-        """归一化 State，再将最后一维右侧补到 ``target_dim``。"""
-        if target_dim < self.state_dim:
-            raise ValueError(
-                f"target_dim={target_dim} 小于真实 State 维度 {self.state_dim}。"
-            )
-        normalized = self.normalize(states, valid_mask=valid_mask)
-        return F.pad(normalized, (0, target_dim - self.state_dim))
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,9 +167,10 @@ def build_global_demo_sample(
 ) -> GlobalDemoSample:
     """将一条完整 Demo 切成 Global Encoder 所需的固定长度 clips。
 
-    所有 clip 按原时间顺序排列。``clip_stride < clip_length`` 时允许重叠；
-    最后一个 clip 不足 ``clip_length`` 时右侧补零，并由 ``valid_mask``
-    区分真实帧和 padding。
+    所有 clip 按原时间顺序排列。``clip_stride < clip_length`` 时允许重叠。
+    Demo 长度达到一个 clip 时，末尾必须再生成一个右对齐的
+    完整 clip，避免最后少量帧因有效比例不足被 Global Encoder 屏蔽。
+    只有整条 Demo 短于 ``clip_length`` 时才在右侧 padding。
     """
     cfg = config or GlobalEncoderConfig()
     frame_mask = (
@@ -301,10 +195,13 @@ def build_global_demo_sample(
 
     num_frames = int(video.shape[0])
     if num_frames <= cfg.clip_length:
-        num_clips = 1
+        start_indices = [0]
     else:
-        num_clips = math.ceil((num_frames - cfg.clip_length) / cfg.clip_stride) + 1
-    start_indices = [index * cfg.clip_stride for index in range(num_clips)]
+        last_start = num_frames - cfg.clip_length
+        start_indices = list(range(0, last_start + 1, cfg.clip_stride))
+        if start_indices[-1] != last_start:
+            start_indices.append(last_start)
+    num_clips = len(start_indices)
 
     output_video = video.new_zeros(
         num_clips,
@@ -400,10 +297,10 @@ def collate_local_demo_chunks(
 ) -> LocalDemoBatch:
     """堆叠 Stage Matcher 已经选定的固定长度 Local Chunks。
 
-    本函数不再执行 State 归一化。``DemoEmbeddingCache`` 必须使用
-    :meth:`DemoStateNormalizer.normalize` 的未补齐输出构建，保证 Matcher
-    的 ``-1`` 仍表示真实 State 末维。本函数再为 Local Encoder 将 State
-    补到 ``expected_state_dim``。
+    本函数不再执行 State 归一化。``DemoEmbeddingCache`` 已经使用共享的
+    :class:`DemoStateNormalizer` 将 raw State 归一化，并保留真实 State 宽度，
+    保证 Matcher 的 ``-1`` 表示真实夹爪维。本函数再为
+    Local Encoder 将 State 和 Velocity 各自补到 ``expected_state_dim``。
     """
     if len(chunks) == 0:
         raise ValueError("Local Demo batch 至少需要一个 chunk。")
@@ -438,6 +335,11 @@ def collate_local_demo_chunks(
                 f"Local Demo 真实 State 维度 {raw_state_dim} 超过 "
                 f"expected_state_dim={expected_state_dim}。"
             )
+        if chunk.state_features.shape != (chunk_length, raw_state_dim * 2):
+            raise ValueError(
+                "Local Demo state_features 必须按 [State, Velocity] 排列为 "
+                f"({chunk_length},{raw_state_dim * 2})。"
+            )
         if (chunk.visual_tokens is not None) != has_visual_tokens:
             raise ValueError("同一 Local Demo batch 不能混用有/无 visual_tokens 的 chunk。")
         for field_name in tensor_fields:
@@ -462,11 +364,23 @@ def collate_local_demo_chunks(
         )
 
     metadata_device = reference.valid_mask.device
+    states = stack("states")
+    state_features = stack("state_features")
+    state_values, state_velocities = state_features.split(raw_state_dim, dim=-1)
+    state_padding = expected_state_dim - raw_state_dim
     return LocalDemoBatch(
         visual_tokens=visual_tokens,
         visual_embeddings=stack("visual_embeddings"),
-        states=F.pad(stack("states"), (0, expected_state_dim - raw_state_dim)),
-        state_features=stack("state_features"),
+        states=F.pad(states, (0, state_padding)),
+        # State 和 Velocity 必须分别补齐后再拼回，不能直接
+        # 在末尾补零，否则会破坏 [State(32), Velocity(32)] 的分段语义。
+        state_features=torch.cat(
+            [
+                F.pad(state_values, (0, state_padding)),
+                F.pad(state_velocities, (0, state_padding)),
+            ],
+            dim=-1,
+        ),
         timestamps=stack("timestamps"),
         relative_time_s=stack("relative_time_s"),
         relative_position=stack("relative_position"),

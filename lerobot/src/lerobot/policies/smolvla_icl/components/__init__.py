@@ -15,18 +15,24 @@ from .demo_alignment import (
     reuse_smolvla_siglip,
 )
 from .global_encoder import GlobalDemoEncoder, GlobalEncoderOutput, S3DVideoBackbone
+from .local_encoder import LocalDemoEncoder, LocalEncoderOutput
+from .state_normalizer import DemoStateNormalizer, StateNormalizationSignature
 
 __all__ = [
     "AlignmentChunkEmbedding",
     "AlignmentResult",
     "DemoEmbeddingCache",
+    "DemoStateNormalizer",
     "GlobalDemoEncoder",
     "GlobalEncoderOutput",
     "LocalDemoChunk",
+    "LocalDemoEncoder",
+    "LocalEncoderOutput",
     "ObservationHistoryBuffer",
     "OnlineDTWMatcher",
     "S3DVideoBackbone",
     "SmolVLASigLIPHandle",
+    "StateNormalizationSignature",
     "extract_matching_state_features",
     "extract_state_features",
     "load_smolvla_siglip",

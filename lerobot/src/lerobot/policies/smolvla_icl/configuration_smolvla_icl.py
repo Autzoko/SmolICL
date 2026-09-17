@@ -55,7 +55,7 @@ class GlobalEncoderConfig:
     output_dim: int = 720
 
     # 一个 clip 至少需要达到该有效帧比例才会交给 Temporal
-    # Aggregator。无效帧会在视频骨干和 State Encoder 前清零。
+    # Aggregator。视频侧用有效帧补满后进入 S3D，State 侧按 mask 清零。
     min_valid_frame_fraction: float = 0.5
     eps: float = 1e-6
 
@@ -100,6 +100,53 @@ class GlobalEncoderConfig:
 
 
 @dataclass
+class LocalEncoderConfig:
+    """Local Demo Encoder 的逐帧多模态嵌入配置。
+
+    Local Encoder 使用一个可学习 query 压缩每帧的 spatial visual
+    tokens，再把已对齐的每个 Demo observation 转换为 Demo Expert
+    宽度的一个 token。跨帧时序交互由后续 Demo Expert
+    Self-Attention 负责，本配置因此不包含额外的 GRU 或 Transformer 参数。
+    """
+
+    # SmolVLA connector 输出宽度默认与 VLM hidden size 一致。
+    visual_feature_dim: int = 960
+    state_dim: int = 32
+
+    # RGB 和 [State, dState/dt] 分别投影后再融合。
+    visual_projection_dim: int = 512
+    state_projection_dim: int = 128
+    output_dim: int = 720
+
+    # relative time、relative position 和 global phase 各使用一份
+    # SmolVLA 风格的连续正弦/余弦编码。
+    temporal_embedding_dim: int = 128
+    min_period: float = 4e-3
+    max_period: float = 4.0
+
+    def __post_init__(self) -> None:
+        """只验证会直接决定线性层和正弦编码形状的参数。"""
+        dimensions = (
+            self.visual_feature_dim,
+            self.state_dim,
+            self.visual_projection_dim,
+            self.state_projection_dim,
+            self.output_dim,
+            self.temporal_embedding_dim,
+        )
+        if any(dimension < 1 for dimension in dimensions):
+            raise ValueError("Local Encoder 的所有特征维度都必须大于 0。")
+        if self.temporal_embedding_dim % 2 != 0:
+            raise ValueError("temporal_embedding_dim 必须是偶数。")
+        if (
+            not math.isfinite(self.min_period)
+            or not math.isfinite(self.max_period)
+            or not 0 < self.min_period <= self.max_period
+        ):
+            raise ValueError("Local Encoder 的时间编码周期必须是有限正数且从小到大。")
+
+
+@dataclass
 class DemoAlignmentConfig:
     """Demo 缓存、因果 Query 窗口和在线 DTW 的配置。"""
 
@@ -109,8 +156,8 @@ class DemoAlignmentConfig:
     alignment_hz: float = 10.0
     window_duration_s: float = 1.0
 
-    # Demo 在任务开始前一次性编码。视觉 token 只在后续 Demo Expert
-    # 需要空间信息时保存；Stage Match 本身只使用池化特征。
+    # Demo 在任务开始前一次性编码。Matcher 继续使用池化特征，
+    # Local Encoder 则从同一次视觉前向中读取完整空间 tokens。
     demo_encode_batch_size: int = 16
     min_valid_fraction: float = 0.5
     normalize_visual_features: bool = True
@@ -246,4 +293,4 @@ class DemoAlignmentConfig:
         )
 
 
-__all__ = ["DemoAlignmentConfig", "GlobalEncoderConfig"]
+__all__ = ["DemoAlignmentConfig", "GlobalEncoderConfig", "LocalEncoderConfig"]
