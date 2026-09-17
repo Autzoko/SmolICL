@@ -517,12 +517,25 @@ class DemoEmbeddingCache:
         if len(raw_states) != len(preprocessed_images) or len(timestamps) != len(preprocessed_images):
             raise ValueError("Demo image/state/timestamp 的时间长度必须一致。")
 
+        frame_valid = (
+            torch.ones(len(preprocessed_images), dtype=torch.bool, device=preprocessed_images.device)
+            if valid_mask is None
+            else valid_mask.to(device=preprocessed_images.device, dtype=torch.bool)
+        )
+        if frame_valid.shape != preprocessed_images.shape[:1]:
+            raise ValueError("valid_mask 必须与 Demo 图像帧数一致。")
+        safe_images = torch.where(
+            frame_valid[:, None, None, None],
+            preprocessed_images,
+            torch.zeros_like(preprocessed_images),
+        )
+
         cache_device = torch.device(cfg.cache_device)
         frame_batches: list[Tensor] = []
         token_batches: list[Tensor] = []
-        for start in range(0, len(preprocessed_images), cfg.demo_encode_batch_size):
+        for start in range(0, len(safe_images), cfg.demo_encode_batch_size):
             tokens = siglip.encode_visual_tokens(
-                preprocessed_images[start : start + cfg.demo_encode_batch_size]
+                safe_images[start : start + cfg.demo_encode_batch_size]
             )
             # Matcher 使用未归一化的 pooled feature 构建检索特征，
             # 所需的 L2 归一化稍后单独执行。Local Encoder 则读取下方
@@ -545,7 +558,7 @@ class DemoEmbeddingCache:
             timestamps,
             state_normalizer=state_normalizer,
             config=cfg,
-            valid_mask=valid_mask,
+            valid_mask=frame_valid,
             visual_tokens=torch.cat(token_batches) if token_batches else None,
         )
 

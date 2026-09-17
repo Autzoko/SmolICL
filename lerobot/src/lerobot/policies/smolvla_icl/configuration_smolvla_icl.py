@@ -6,8 +6,12 @@
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Self
+
+from lerobot.configs import PreTrainedConfig
+
+from ..smolvla.configuration_smolvla import SmolVLAConfig
 
 
 @dataclass
@@ -293,4 +297,88 @@ class DemoAlignmentConfig:
         )
 
 
-__all__ = ["DemoAlignmentConfig", "GlobalEncoderConfig", "LocalEncoderConfig"]
+@PreTrainedConfig.register_subclass("smolvla_icl")
+@dataclass
+class SmolVLAICLConfig(SmolVLAConfig):
+    """SmolVLA-ICL 顶层配置。
+
+    VLM、Action Expert、flow matching 和图像/语言预处理参数全部继承
+    SmolVLA 默认值；这里只增加 Demo 路径配置与两条新增 Cross-Attention
+    的残差门控。首版固定使用设计文档中的 16 层、偶数层 Union、奇数层
+    Cross 结构，避免缩减 Expert 层数后破坏层类型对应关系。
+    """
+
+    global_encoder: GlobalEncoderConfig = field(default_factory=GlobalEncoderConfig)
+    local_encoder: LocalEncoderConfig = field(default_factory=LocalEncoderConfig)
+    demo_alignment: DemoAlignmentConfig = field(default_factory=DemoAlignmentConfig)
+
+    # 使用很小的非零 gate：基本保持预训练 SmolVLA 的初始行为，同时让
+    # Global/Local Encoder、Demo Expert 和 Cross-Attention 从第一次反传
+    # 就能收到任务损失梯度。设为 0 会使首步只有 gate 自身有梯度。
+    global_cross_gate_init: float = 1e-3
+    local_cross_gate_init: float = 1e-3
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.attention_mode != "cross_attn" or self.self_attn_every_n_layers != 2:
+            raise ValueError(
+                "SmolVLA-ICL 首版要求 attention_mode='cross_attn' 且 "
+                "self_attn_every_n_layers=2。"
+            )
+        if self.num_vlm_layers != 16 or not math.isclose(
+            self.expert_width_multiplier,
+            0.75,
+        ):
+            raise ValueError("SmolVLA-ICL 首版固定使用 16 层 VLM 和 0.75 Expert 宽度。")
+        if self.num_expert_layers > 0:
+            raise ValueError(
+                "SmolVLA-ICL 首版要求 num_expert_layers<=0，使 Action/Demo Expert "
+                "与 VLM 保持相同层数。"
+            )
+        if not self.use_cache:
+            raise NotImplementedError("SmolVLA-ICL 推理固定使用 P/G/L condition cache。")
+        if self.compile_model:
+            raise NotImplementedError("SmolVLA-ICL 尚未接入 torch.compile。")
+        if self.rtc_config is not None and self.rtc_config.enabled:
+            raise NotImplementedError("SmolVLA-ICL 尚未接入 RTC。")
+        if self.adapt_to_pi_aloha:
+            raise NotImplementedError(
+                "SmolVLA-ICL 尚未统一 ALOHA Prefix 与 Demo Matcher 的 State 坐标系。"
+            )
+        if not self.train_expert_only:
+            raise NotImplementedError(
+                "首版 Local Demo 使用预计算 connector tokens，因此必须冻结 VLM。"
+            )
+        if self.global_encoder.output_dim != self.local_encoder.output_dim:
+            raise ValueError("Global/Local Encoder 的 output_dim 必须一致。")
+        if (
+            self.global_encoder.state_dim != self.max_state_dim
+            or self.local_encoder.state_dim != self.max_state_dim
+        ):
+            raise ValueError("Global/Local Encoder state_dim 必须等于 max_state_dim。")
+        if not math.isfinite(self.global_cross_gate_init) or not math.isfinite(
+            self.local_cross_gate_init
+        ):
+            raise ValueError("Cross-Attention gate 初始值必须是有限数。")
+
+    def validate_features(self) -> None:
+        """验证真实 State/Action 维度能被 SmolVLA 的固定投影接收。"""
+        super().validate_features()
+        state_feature = self.robot_state_feature
+        action_feature = self.action_feature
+        if state_feature is None or len(state_feature.shape) != 1:
+            raise ValueError("SmolVLA-ICL 需要一维 observation.state 特征。")
+        if action_feature is None or len(action_feature.shape) != 1:
+            raise ValueError("SmolVLA-ICL 需要一维 action 特征。")
+        if state_feature.shape[0] > self.max_state_dim:
+            raise ValueError("真实 State 维度不能超过 max_state_dim。")
+        if action_feature.shape[0] > self.max_action_dim:
+            raise ValueError("真实 Action 维度不能超过 max_action_dim。")
+
+
+__all__ = [
+    "DemoAlignmentConfig",
+    "GlobalEncoderConfig",
+    "LocalEncoderConfig",
+    "SmolVLAICLConfig",
+]

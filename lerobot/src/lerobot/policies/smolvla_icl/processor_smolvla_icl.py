@@ -1,6 +1,6 @@
 """SmolVLA-ICL Demo 输入的最小数据契约。
 
-本模块暂不构建完整的 :class:`PolicyProcessorPipeline`，只处理当前
+本模块复用 SmolVLA 的标准 Policy pre/post pipeline，并处理
 Global/Local Demo 路径已经确定的数据边界：
 
 1. 使用与 SmolVLA Current State 相同的 mean/std 归一化 Demo State；
@@ -8,22 +8,26 @@ Global/Local Demo 路径已经确定的数据边界：
 3. 将变长 Demo 在 clip 维度补齐为 batch；
 4. 将 Stage Matcher 已经选定的 :class:`LocalDemoChunk` 堆叠为 batch。
 
-这里不运行 Stage Matcher，也不改变 Local Chunk 的锚点和时间范围。
+Demo 数据函数不运行 Stage Matcher，也不改变 Local Chunk 的锚点和时间范围。
 Matcher 负责“选哪一段”，Processor 只负责“归一化、补齐和组 batch”。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Self, Sequence
+from typing import Any, Self, Sequence
 
 import torch
 from torch import Tensor
 from torch.nn import functional as F
 
+from lerobot.lerobot_types import PolicyAction
+from lerobot.processor import PolicyProcessorPipeline
+
+from ..smolvla.processor_smolvla import make_smolvla_pre_post_processors
 from .components.demo_alignment import LocalDemoChunk
 from .components.state_normalizer import DemoStateNormalizer
-from .configuration_smolvla_icl import GlobalEncoderConfig
+from .configuration_smolvla_icl import GlobalEncoderConfig, SmolVLAICLConfig
 
 
 __all__ = [
@@ -34,7 +38,24 @@ __all__ = [
     "build_global_demo_sample",
     "collate_global_demo_samples",
     "collate_local_demo_chunks",
+    "make_smolvla_icl_pre_post_processors",
 ]
+
+
+def make_smolvla_icl_pre_post_processors(
+    config: SmolVLAICLConfig,
+    dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+) -> tuple[
+    PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+    PolicyProcessorPipeline[PolicyAction, PolicyAction],
+]:
+    """复用 SmolVLA 的标准输入归一化与输出反归一化管线。
+
+    ICL 新增的完整 Demo 由 :meth:`SmolVLAICLPolicy.set_demo` 单独注册，
+    不应混入逐步 Observation preprocessor。模型输出先在 Policy 中裁剪到
+    真实动作维度，再由这里返回的 postprocessor 恢复到机器人动作尺度。
+    """
+    return make_smolvla_pre_post_processors(config, dataset_stats)
 
 
 @dataclass(frozen=True, slots=True)

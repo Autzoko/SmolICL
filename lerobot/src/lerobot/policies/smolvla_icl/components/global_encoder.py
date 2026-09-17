@@ -286,6 +286,25 @@ class _MaskedStateEncoder(nn.Module):
         return torch.where(clip_valid[:, None], clip_hidden, torch.zeros_like(clip_hidden))
 
 
+class _LearnedTaskQueries(nn.Module):
+    """保存并展开 Global Encoder 的可学习 Task Queries。
+
+    单独封装成模块后，PEFT 可以完整训练和保存这些新增参数，而不必把冻结的
+    S3D 视频骨干一并放入 ``modules_to_save``。
+    """
+
+    def __init__(self, num_queries: int, hidden_size: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(1, num_queries, hidden_size))
+        nn.init.normal_(self.weight, mean=0.0, std=0.02)
+
+    def forward(self, reference: Tensor) -> Tensor:
+        """按参考 clip Tensor 的 batch、device 和 dtype 展开 queries。"""
+        return self.weight.to(device=reference.device, dtype=reference.dtype).expand(
+            reference.shape[0], -1, -1
+        )
+
+
 class GlobalDemoEncoder(nn.Module):
     """RGB+State Full Demo -> Global Task Tokens。
 
@@ -351,20 +370,20 @@ class GlobalDemoEncoder(nn.Module):
             num_layers=self.config.temporal_num_layers,
             norm=nn.LayerNorm(self.config.temporal_hidden_size),
         )
-        self.task_queries = nn.Parameter(
-            torch.empty(
-                1,
-                self.config.num_global_tokens,
-                self.config.temporal_hidden_size,
-            )
+        self.task_query_bank = _LearnedTaskQueries(
+            self.config.num_global_tokens,
+            self.config.temporal_hidden_size,
         )
         self.output_projection = nn.Sequential(
             nn.Linear(self.config.temporal_hidden_size, self.config.output_dim),
             nn.LayerNorm(self.config.output_dim),
         )
-        nn.init.normal_(self.task_queries, mean=0.0, std=0.02)
-
         self._set_video_backbone_trainability()
+
+    @property
+    def task_queries(self) -> nn.Parameter:
+        """兼容原接口，返回实际参与计算的 Task Query 参数。"""
+        return self.task_query_bank.weight
 
     def _set_video_backbone_trainability(self) -> None:
         """按配置冻结视频骨干，并固定 BatchNorm/Dropout 的运行模式。"""
@@ -482,7 +501,7 @@ class GlobalDemoEncoder(nn.Module):
         clip_input = fused + phase_embedding
         clip_input = clip_input * clip_mask.unsqueeze(-1).to(clip_input.dtype)
 
-        task_queries = self.task_queries.to(dtype=clip_input.dtype).expand(batch_size, -1, -1)
+        task_queries = self.task_query_bank(clip_input)
         temporal_input = torch.cat([task_queries, clip_input], dim=1)
         global_mask = torch.ones(
             batch_size,
