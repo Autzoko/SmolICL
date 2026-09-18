@@ -1,7 +1,7 @@
 """SmolVLA-ICL 共享的 State 归一化契约。
 
 Global、Local 和 Stage Matcher 都必须使用同一份训练集统计量。
-将该类放在独立组件中，可以让 Processor 和 Matcher 共享实现，
+将该类放在独立数据模块中，可以让 Collator 和 Matcher 共享实现，
 而不需要互相导入。
 """
 

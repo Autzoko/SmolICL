@@ -174,6 +174,10 @@ _COMPLEMENTARY_KEYS = (
     MESSAGES_RENDERED,
     "message_streams",
     "target_message_indices",
+    # SmolVLA-ICL 的结构化 Demo batch。它们不是普通 observation feature，
+    # 但必须穿过标准 Policy preprocessor 后继续交给 policy(batch)。
+    "smolvla_icl.global_demo",
+    "smolvla_icl.local_demo",
     # Text-generation request keys: carried into complementary_data so a prompt-formatting
     # processor step can read the kind and rewrite QUERY_TEXT.
     QUERY_KIND,

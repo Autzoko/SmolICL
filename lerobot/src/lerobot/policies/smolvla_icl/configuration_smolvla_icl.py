@@ -160,13 +160,12 @@ class DemoAlignmentConfig:
     alignment_hz: float = 10.0
     window_duration_s: float = 1.0
 
-    # Demo 在任务开始前一次性编码。Matcher 继续使用池化特征，
-    # Local Encoder 则从同一次视觉前向中读取完整空间 tokens。
+    # Demo Matcher 在任务开始前用独立冻结 snapshot 一次性编码。
+    # Matcher cache 不保存供模型训练使用的 Local spatial tokens。
     demo_encode_batch_size: int = 16
     min_valid_fraction: float = 0.5
     normalize_visual_features: bool = True
     cache_device: str = "cpu"
-    cache_visual_tokens: bool = True
 
     # ``rgb_only`` 用于消融实验。启用后 Matcher 完全跳过 State distance，
     # State 仍保留在缓存中，供匹配后的 Local Demo 使用。
@@ -312,6 +311,20 @@ class SmolVLAICLConfig(SmolVLAConfig):
     local_encoder: LocalEncoderConfig = field(default_factory=LocalEncoderConfig)
     demo_alignment: DemoAlignmentConfig = field(default_factory=DemoAlignmentConfig)
 
+    # Query RGB 和 Local Demo RGB 共享这一套可训练视觉编码器。
+    # Matcher 使用另一份冻结 snapshot，不受该开关影响。
+    freeze_vision_encoder: bool = False
+
+    # 训练数据只保存 demo_id/query_anchor/local_anchor；该目录只保存
+    # 冻结 S3D 的 Global clip feature。Local RGB 由 Dataset 按 anchor 读取。
+    training_demo_cache_dir: str | None = None
+    # 离线 DTW 配对表。它只记录 Query episode/frame 到
+    # ``demo_id + local_anchor`` 的映射，不保存任何 RGB 或模型 token。
+    pairing_sidecar_path: str | None = None
+    # 该 LRU 位于每个 DataLoader worker 内，只缓存最近使用的
+    # Global S3D feature，不缓存 Local RGB 或模型视觉 tokens。
+    training_demo_cache_memory_entries: int = 1
+
     # 使用很小的非零 gate：基本保持预训练 SmolVLA 的初始行为，同时让
     # Global/Local Encoder、Demo Expert 和 Cross-Attention 从第一次反传
     # 就能收到任务损失梯度。设为 0 会使首步只有 gate 自身有梯度。
@@ -320,6 +333,8 @@ class SmolVLAICLConfig(SmolVLAConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.training_demo_cache_memory_entries < 0:
+            raise ValueError("training_demo_cache_memory_entries 不能为负数。")
         if self.attention_mode != "cross_attn" or self.self_attn_every_n_layers != 2:
             raise ValueError(
                 "SmolVLA-ICL 首版要求 attention_mode='cross_attn' 且 "
@@ -344,10 +359,6 @@ class SmolVLAICLConfig(SmolVLAConfig):
         if self.adapt_to_pi_aloha:
             raise NotImplementedError(
                 "SmolVLA-ICL 尚未统一 ALOHA Prefix 与 Demo Matcher 的 State 坐标系。"
-            )
-        if not self.train_expert_only:
-            raise NotImplementedError(
-                "首版 Local Demo 使用预计算 connector tokens，因此必须冻结 VLM。"
             )
         if self.global_encoder.output_dim != self.local_encoder.output_dim:
             raise ValueError("Global/Local Encoder 的 output_dim 必须一致。")

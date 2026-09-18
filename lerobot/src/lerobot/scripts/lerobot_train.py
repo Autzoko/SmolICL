@@ -290,7 +290,14 @@ def make_dataloaders(
         # BatchSamplerShard without needing a `generator` attribute to synchronize an RNG, and
         # resume is sample-exact.
         shuffle = False
-        sampler = EpisodeAwareSampler(
+        sampler_cls = EpisodeAwareSampler
+        if active_cfg.type == "smolvla_icl":
+            from lerobot.policies.smolvla_icl.data.sampler import (
+                SmolVLAICLEpisodeAwareSampler,
+            )
+
+            sampler_cls = SmolVLAICLEpisodeAwareSampler
+        sampler = sampler_cls(
             dataset.meta.episodes["dataset_from_index"],
             dataset.meta.episodes["dataset_to_index"],
             episode_indices_to_use=dataset.episodes,
@@ -333,10 +340,35 @@ def make_dataloaders(
         sampler = None
 
     device_type = parallel_dims.device_type
-    # Only swap in the language-aware collate when the dataset actually
-    # declares language columns; otherwise stay on PyTorch's default
-    # collate so non-language training runs are unaffected.
-    collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+    # SmolVLA-ICL 仍使用 LeRobot 的 Query Dataset/Sampler。专用 collator 只额外
+    # 读取冻结 Global S3D feature 和 sidecar 指定的 raw Local 窗口；
+    # Local RGB 在 Policy forward 内经过与 Query 共享的可训练视觉编码器。
+    if active_cfg.type == "smolvla_icl":
+        from lerobot.policies.smolvla_icl.data.cache import SmolVLAICLCollator
+        from lerobot.policies.smolvla_icl.data.state import DemoStateNormalizer
+
+        if active_cfg.training_demo_cache_dir is None:
+            raise ValueError(
+                "SmolVLA-ICL 训练必须配置 policy.training_demo_cache_dir，"
+                "并提前生成冻结 S3D Demo 特征。"
+            )
+        local_demo_reader = getattr(dataset, "local_demo_reader", None)
+        if not callable(local_demo_reader):
+            raise ValueError(
+                "SmolVLA-ICL Dataset 必须提供 local_demo_reader(ref)，"
+                "用于按 demo_id/local_anchor 读取 raw Local RGB+State 窗口。"
+            )
+        collate_fn = SmolVLAICLCollator(
+            active_cfg.training_demo_cache_dir,
+            local_demo_reader=local_demo_reader,
+            state_normalizer=DemoStateNormalizer.from_dataset_stats(
+                rename_stats(dataset.meta.stats, cfg.rename_map)
+            ),
+            expected_state_dim=active_cfg.max_state_dim,
+            memory_entries=active_cfg.training_demo_cache_memory_entries,
+        )
+    else:
+        collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -365,7 +397,20 @@ def make_dataloaders(
                 selected.extend(frames.tolist())
             eval_ds = torch.utils.data.Subset(eval_dataset, selected)
 
-        eval_collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+        eval_collate_fn = collate_fn
+        if active_cfg.type == "smolvla_icl":
+            eval_local_demo_reader = getattr(eval_dataset, "local_demo_reader", None)
+            if not callable(eval_local_demo_reader):
+                raise ValueError("SmolVLA-ICL eval Dataset 必须提供 local_demo_reader(ref)。")
+            eval_collate_fn = SmolVLAICLCollator(
+                active_cfg.training_demo_cache_dir,
+                local_demo_reader=eval_local_demo_reader,
+                state_normalizer=DemoStateNormalizer.from_dataset_stats(
+                    rename_stats(eval_dataset.meta.stats, cfg.rename_map)
+                ),
+                expected_state_dim=active_cfg.max_state_dim,
+                memory_entries=active_cfg.training_demo_cache_memory_entries,
+            )
         eval_dataloader = torch.utils.data.DataLoader(
             eval_ds,
             batch_size=cfg.batch_size,
@@ -445,6 +490,15 @@ def train(cfg: TrainPipelineConfig):
     accelerator.wait_for_everyone()
     if not is_main_process():
         dataset, eval_dataset = make_train_eval_datasets(cfg)
+
+    if cfg.trainable_config.type == "smolvla_icl":
+        from lerobot.policies.smolvla_icl.data.factory import prepare_smolvla_icl_datasets
+
+        dataset, eval_dataset = prepare_smolvla_icl_datasets(
+            cfg,
+            dataset,
+            eval_dataset,
+        )
 
     # --- policy (weight source decided by the resume rule) -------------------------------------
     # On resume, cfg was parsed FROM the checkpoint's train_config.json, so cfg.checkpoint_format

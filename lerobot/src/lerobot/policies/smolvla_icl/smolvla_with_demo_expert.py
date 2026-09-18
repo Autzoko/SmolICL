@@ -340,6 +340,27 @@ class SmolVLMWithDemoExpertModel(SmolVLMWithExpertModel):
             ).to(device=reference_weight.device, dtype=reference_weight.dtype)
             self.action_from_local[str(layer_idx)] = adapter
 
+    def set_requires_grad(self) -> None:
+        """保留 expert-only 训练，但允许 Query/Local 共享的视觉路径更新。
+
+        官方 SmolVLA 的 ``train_expert_only=True`` 会冻结整个 VLM。ICL 在
+        ``freeze_vision_encoder=False`` 时只重新开启 vision model 和 connector，
+        text model 仍按官方 expert-only 语义冻结。
+        """
+        super().set_requires_grad()
+        if not self.freeze_vision_encoder:
+            for module in (self.get_vlm_model().vision_model, self.get_vlm_model().connector):
+                for parameter in module.parameters():
+                    parameter.requires_grad_(True)
+
+    def train(self, mode: bool = True):
+        """让可训练视觉路径保持 train mode，其余冻结 VLM 保持 eval。"""
+        super().train(mode)
+        if mode and not self.freeze_vision_encoder:
+            self.get_vlm_model().vision_model.train()
+            self.get_vlm_model().connector.train()
+        return self
+
     def _get_action_layer(self, layer_idx: int) -> nn.Module:
         """取得与 VLM 同深度的 Action Expert layer。"""
         return self.lm_expert.layers[layer_idx]

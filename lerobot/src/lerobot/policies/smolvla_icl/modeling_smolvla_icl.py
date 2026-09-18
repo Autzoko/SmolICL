@@ -29,20 +29,20 @@ from .components.demo_alignment import (
     DemoEmbeddingCache,
     ObservationHistoryBuffer,
     OnlineDTWMatcher,
+    SmolVLASigLIPHandle,
+    pool_visual_tokens,
     reuse_smolvla_siglip,
 )
-from .components.state_normalizer import DemoStateNormalizer
 from .components.global_encoder import GlobalDemoEncoder, GlobalEncoderOutput
 from .components.local_encoder import LocalDemoEncoder, LocalEncoderOutput
 from .configuration_smolvla_icl import SmolVLAICLConfig
-from .processor_smolvla_icl import (
-    GlobalDemoBatch,
-    LocalDemoBatch,
-    build_global_demo_sample,
-    collate_global_demo_samples,
-    collate_local_demo_chunks,
+from .data.collate import (
+    build_encoded_local_demo_batch,
     get_smolvla_icl_demo_batches,
 )
+from .data.preprocessing import build_global_demo_clips
+from .data.state import DemoStateNormalizer
+from .data.types import EncodedLocalDemoBatch, GlobalDemoBatch, LocalDemoBatch
 from .smolvla_with_demo_expert import (
     FourRegionInputs,
     SmolVLAICLConditionCache,
@@ -294,16 +294,64 @@ class VLAFlowMatchingICL(nn.Module):
         return action_hidden, action_valid_mask
 
     def encode_global_demo(self, demo: GlobalDemoBatch) -> GlobalEncoderOutput:
-        """把 Processor 准备的完整 Demo batch 编码为 Global Tokens。"""
-        return self.global_encoder(
-            demo.video,
+        """把缓存的 S3D feature 与可训练 State 路径编码为 Global Tokens。"""
+        output = self.global_encoder(
+            demo.video_features,
             demo.states,
             demo.timestamps,
             demo.valid_mask,
         )
+        inverse = demo.sample_to_demo
+        return GlobalEncoderOutput(
+            global_tokens=output.global_tokens.index_select(0, inverse),
+            global_mask=output.global_mask.index_select(0, inverse),
+            clip_tokens=output.clip_tokens.index_select(0, inverse),
+            clip_mask=output.clip_mask.index_select(0, inverse),
+            clip_phase=output.clip_phase.index_select(0, inverse),
+        )
 
     def encode_local_demo(self, demo: LocalDemoBatch) -> LocalEncoderOutput:
-        """把 Matcher 选定并组 batch 的 Local Chunk 编码为 Local Tokens。"""
+        """训练路径：使用与 Query 共享的可训练 ``E_vision`` 编码 raw Local RGB。"""
+        batch_size, chunk_length = demo.images.shape[:2]
+        flat_images = demo.images.flatten(0, 1)
+        if self.config.resize_imgs_with_padding is not None:
+            target_width, target_height = self.config.resize_imgs_with_padding
+            flat_images = resize_with_pad(
+                flat_images,
+                target_height,
+                target_width,
+                pad_value=0,
+            )
+        flat_images = flat_images * 2.0 - 1.0
+
+        # Padding 帧不进入 SigLIP；index_copy 保留有效帧的梯度路径。
+        valid_indices = torch.nonzero(demo.valid_mask.flatten(), as_tuple=False).flatten()
+        valid_tokens = self.vlm_with_expert.embed_image(flat_images[valid_indices])
+        flat_tokens = valid_tokens.new_zeros(
+            flat_images.shape[0],
+            valid_tokens.shape[1],
+            valid_tokens.shape[2],
+        ).index_copy(0, valid_indices, valid_tokens)
+        visual_tokens = flat_tokens.unflatten(0, (batch_size, chunk_length))
+        visual_embeddings = pool_visual_tokens(flat_tokens, normalize=False).unflatten(
+            0,
+            (batch_size, chunk_length),
+        )
+        return self.local_encoder(
+            visual_embeddings,
+            demo.state_features,
+            demo.relative_time_s,
+            demo.relative_position,
+            demo.phase,
+            demo.valid_mask,
+            visual_tokens=visual_tokens,
+        )
+
+    def encode_encoded_local_demo(
+        self,
+        demo: EncodedLocalDemoBatch,
+    ) -> LocalEncoderOutput:
+        """rollout 路径：直接消费 ``set_demo`` 时缓存的 ``E_vision`` 特征。"""
         return self.local_encoder(
             demo.visual_embeddings,
             demo.state_features,
@@ -429,7 +477,7 @@ class VLAFlowMatchingICL(nn.Module):
         language_masks: Tensor,
         state: Tensor,
         global_output: GlobalEncoderOutput,
-        local_demo: LocalDemoBatch,
+        local_demo: EncodedLocalDemoBatch,
         noise: Tensor | None = None,
         image_embeddings: list[Tensor] | None = None,
     ) -> Tensor:
@@ -459,7 +507,7 @@ class VLAFlowMatchingICL(nn.Module):
             state,
             image_embeddings=image_embeddings,
         )
-        local_output = self.encode_local_demo(local_demo)
+        local_output = self.encode_encoded_local_demo(local_demo)
 
         # condition cache 只需要 Action 区域的长度、mask 和位置，不读取其
         # hidden 数值，因此不必额外执行一次 action/time embedding。
@@ -598,7 +646,10 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
 
         self._global_output: GlobalEncoderOutput | None = None
         self._demo_cache: DemoEmbeddingCache | None = None
+        self._demo_visual_tokens: Tensor | None = None
+        self._demo_visual_embeddings: Tensor | None = None
         self._matcher: OnlineDTWMatcher | None = None
+        self._matcher_siglip: SmolVLASigLIPHandle | None = None
         self._observation_history: ObservationHistoryBuffer | None = None
         self._matcher_image_key: str | None = None
         self._replan_index = 0
@@ -627,6 +678,7 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
         并让其中的标量 gate 一同训练和保存。
         """
         modules = [
+            "model.vlm_with_expert.vlm.model.connector",
             "model.global_encoder.state_encoder",
             "model.global_encoder.rgb_state_fusion",
             "model.global_encoder.temporal_aggregator",
@@ -651,6 +703,12 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
     def _get_default_peft_targets(self) -> dict[str, Any]:
         """在 SmolVLA LoRA 目标上补充需要完整训练的 ICL 模块。"""
         targets = super()._get_default_peft_targets()
+        # PEFT 会先冻结全部 base parameters，因此需要显式将 SigLIP
+        # attention 投影加入 LoRA 目标。Connector 规模较小，保持完整训练。
+        targets["target_modules"] = (
+            rf"({targets['target_modules']}|"
+            r"model\.vlm_with_expert\.vlm\.model\.vision_model\..*\.(q|v)_proj)"
+        )
         targets["modules_to_save"] = self._icl_modules_to_save()
         return targets
 
@@ -683,6 +741,7 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
         valid_mask: Tensor | None = None,
         state_normalizer: DemoStateNormalizer | None = None,
         matcher_image_key: str | None = None,
+        matcher_siglip: SmolVLASigLIPHandle | None = None,
     ) -> None:
         """注册一条完整 Demo，并一次性建立 Global 与 Matcher 输入。
 
@@ -705,7 +764,7 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
             if valid_mask is None
             else valid_mask.to(device=video.device, dtype=torch.bool)
         )
-        global_sample = build_global_demo_sample(
+        global_clips = build_global_demo_clips(
             video,
             states,
             timestamps,
@@ -714,11 +773,21 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
             valid_mask=frame_mask,
         )
         model_device = next(self.model.parameters()).device
-        global_batch = collate_global_demo_samples([global_sample]).to(model_device)
-        global_output = self.model.encode_global_demo(global_batch)
+        global_video = global_clips.video.unsqueeze(0).to(model_device)
+        global_mask = global_clips.valid_mask.unsqueeze(0).to(model_device)
+        global_features = self.model.global_encoder.encode_video_clips(
+            global_video,
+            global_mask,
+        )
+        global_output = self.model.global_encoder(
+            global_features,
+            global_clips.states.unsqueeze(0).to(model_device),
+            global_clips.timestamps.unsqueeze(0).to(model_device),
+            global_mask,
+        )
 
-        # Matcher 与 Prefix 使用同一套 SmolVLM vision_model + connector。
-        # Demo 仅在这里做一次 SmolVLA 图像预处理和视觉前向。
+        # Matcher snapshot 和模型视觉编码器是两条独立路径。只有当模型的
+        # vision model 与 connector 都已冻结时，才允许直接复用它做 Matcher。
         matcher_images = video.to(model_device)
         if self.config.resize_imgs_with_padding is not None:
             target_width, target_height = self.config.resize_imgs_with_padding
@@ -729,12 +798,31 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
                 pad_value=0,
             )
         matcher_images = matcher_images * 2.0 - 1.0
-        siglip = reuse_smolvla_siglip(
-            self.model,
-            freeze=self.config.freeze_vision_encoder,
+        model_siglip = reuse_smolvla_siglip(self.model, freeze=False)
+        vision_trainable = any(
+            parameter.requires_grad for parameter in model_siglip.vision_model.parameters()
         )
+        connector_trainable = any(
+            parameter.requires_grad for parameter in model_siglip.connector.parameters()
+        )
+        model_visual_trainable = vision_trainable or connector_trainable
+        if matcher_siglip is None:
+            if model_visual_trainable:
+                raise ValueError(
+                    "当 SmolVLA vision model 或 connector 可训练时，"
+                    "set_demo 必须传入独立冻结的 matcher_siglip snapshot。"
+                )
+            matcher_siglip = reuse_smolvla_siglip(self.model, freeze=True)
+        if not matcher_siglip.frozen:
+            raise ValueError("matcher_siglip 必须是全程冻结的 snapshot。")
+        shares_trainable_module = (
+            matcher_siglip.vision_model is model_siglip.vision_model and vision_trainable
+        ) or (matcher_siglip.connector is model_siglip.connector and connector_trainable)
+        if shares_trainable_module:
+            raise ValueError("Matcher 不能引用正在训练的模型 vision model 或 connector。")
+
         demo_cache = DemoEmbeddingCache.build(
-            siglip,
+            matcher_siglip,
             matcher_images,
             states,
             timestamps,
@@ -743,12 +831,44 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
             valid_mask=frame_mask,
         )
 
+        # rollout 时模型权重已固定，可在注册 Demo 时一次性用当前
+        # E_vision 生成 Local spatial tokens。这些 tokens 不是 Matcher 特征，
+        # 也不会被写入训练磁盘缓存。
+        local_token_batches = []
+        encode_batch_size = self.config.demo_alignment.demo_encode_batch_size
+        for start in range(0, len(matcher_images), encode_batch_size):
+            local_token_batches.append(
+                model_siglip.encode_visual_tokens(matcher_images[start : start + encode_batch_size])
+                .detach()
+                .to(self.config.demo_alignment.cache_device)
+            )
+        demo_visual_tokens = torch.cat(local_token_batches)
+        demo_visual_embeddings = pool_visual_tokens(demo_visual_tokens, normalize=False)
+        cache_device = torch.device(self.config.demo_alignment.cache_device)
+        local_valid = frame_mask.to(device=cache_device)
+        demo_visual_tokens = torch.where(
+            local_valid[:, None, None],
+            demo_visual_tokens,
+            torch.zeros_like(demo_visual_tokens),
+        )
+        demo_visual_embeddings = torch.where(
+            local_valid[:, None],
+            demo_visual_embeddings,
+            torch.zeros_like(demo_visual_embeddings),
+        )
+
         # 两条 Demo 路径都成功后再一起替换，避免构建中途失败时留下
         # “新 Global + 旧 Matcher”的不一致 Policy 状态。
         self._global_output = global_output
         self._demo_cache = demo_cache
+        # 这是 rollout 专用的 E_vision cache。它与只保存 E_match pooled
+        # feature 的 DemoEmbeddingCache 分开，Matcher 无法把自己的视觉空间
+        # 混入 Local Demo Expert 输入。
+        self._demo_visual_tokens = demo_visual_tokens
+        self._demo_visual_embeddings = demo_visual_embeddings
         self.state_normalizer = normalizer
         self._matcher_image_key = image_key
+        self._matcher_siglip = matcher_siglip
         self._matcher = OnlineDTWMatcher(demo_cache)
         self.reset()
 
@@ -778,15 +898,19 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
     def _match_local_demo(
         self,
         batch: dict[str, Tensor],
+        images: list[Tensor],
         image_embeddings: list[Tensor],
         image_masks: list[Tensor],
-    ) -> LocalDemoBatch:
+    ) -> EncodedLocalDemoBatch:
         """追加当前真实 Observation，推进 Matcher 并组装 Local batch。"""
         if (
             self._demo_cache is None
+            or self._demo_visual_tokens is None
+            or self._demo_visual_embeddings is None
             or self._matcher is None
             or self._observation_history is None
             or self._matcher_image_key is None
+            or self._matcher_siglip is None
         ):
             raise RuntimeError("推理前必须先调用 set_demo(...)。")
 
@@ -799,28 +923,38 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
         if current_state.ndim > 2:
             current_state = current_state[:, -1]
         raw_state = self._normalized_state_to_raw(current_state)
+        model_siglip = reuse_smolvla_siglip(self.model, freeze=False)
+        if (
+            self._matcher_siglip.vision_model is model_siglip.vision_model
+            and self._matcher_siglip.connector is model_siglip.connector
+        ):
+            matcher_tokens = image_embeddings[image_index]
+        else:
+            matcher_tokens = self._matcher_siglip.encode_visual_tokens(images[image_index])
         self._observation_history.append(
             raw_state=raw_state,
             timestamp=self._observation_timestamp(batch),
-            visual_tokens=image_embeddings[image_index],
+            visual_tokens=matcher_tokens,
             observation_id=self._observation_id(batch),
             valid=bool(image_masks[image_index].reshape(-1)[0]),
         )
 
         if self._observation_history.is_ready:
-            _, local_chunk = self._matcher.update_and_extract(
+            _, local_window = self._matcher.update_and_extract(
                 self._observation_history.get_latest_chunk()
             )
         else:
             # episode 起始阶段历史窗口尚未填满时，从 Matcher 当前的第一个
             # 有效锚点读取 Local Chunk；积累充分后自然切换到 DTW 输出。
             anchor = int(self._demo_cache.anchor_indices[self._matcher.active_index])
-            local_chunk = self._demo_cache.extract_local_chunk(anchor)
+            local_window = self._demo_cache.extract_local_window(anchor)
 
         self._replan_index += 1
         model_device = next(self.model.parameters()).device
-        return collate_local_demo_chunks(
-            [local_chunk],
+        return build_encoded_local_demo_batch(
+            local_window,
+            self._demo_visual_tokens,
+            self._demo_visual_embeddings,
             expected_state_dim=self.config.max_state_dim,
         ).to(model_device)
 
@@ -838,10 +972,10 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
             raise ValueError("当前有状态 Stage Matcher 的在线推理仅支持 batch_size=1。")
 
         images, image_masks = self.prepare_images(batch)
-        # connector tokens 同时供 Matcher 池化和 Prefix 使用，避免同一当前帧
-        # 在一次重规划中经过两次 vision encoder。
+        # Query Prefix 使用训练后的 E_vision；Matcher 在下方使用独立
+        # E_match snapshot。当两者确实是同一个冻结对象时才会复用 tokens。
         image_embeddings = self.model.encode_images(images)
-        local_demo = self._match_local_demo(batch, image_embeddings, image_masks)
+        local_demo = self._match_local_demo(batch, images, image_embeddings, image_masks)
         state = self.prepare_state(batch)
         actions = self.model.sample_actions(
             images,

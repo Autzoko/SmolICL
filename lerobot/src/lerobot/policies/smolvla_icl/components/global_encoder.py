@@ -2,19 +2,21 @@
 
 该模块只负责把一条完整 RGB+State Demo 压缩为固定数量的
 Global Task Tokens ``G^(0)``。它不运行 Stage Matcher，不读取当前
-Observation，也不执行 Demo Expert Transformer。这个边界使 Global
-Tokens 可以在 Demo 加载时计算一次，并在后续多次重规划中缓存。
+Observation，也不执行 Demo Expert Transformer。推理时最终 Global Tokens
+可按 Demo 缓存；训练时只能缓存冻结 S3D 的 clip feature，后续可训练路径
+必须在每个 step 中保留计算图。
 
 数据契约：
 
-* RGB: ``(B, K, L, 3, H, W)``，值域为 ``[0, 1]``；
-* State: ``(B, K, L, D_s)``；
-* Timestamp: ``(B, K, L)``，单位为秒；
-* Valid mask: ``(B, K, L)``，``True`` 表示真实 Demo 帧；
+* 离线阶段 RGB: ``(U, K, L, 3, H, W)``，值域为 ``[0, 1]``；
+* 训练阶段冻结 S3D feature: ``(U, K, D_v)``；
+* State: ``(U, K, L, D_s)``；
+* Timestamp: ``(U, K, L)``，单位为秒；
+* Valid mask: ``(U, K, L)``，``True`` 表示真实 Demo 帧；
 * Global Tokens: ``(B, N_G, d_D)``，``d_D`` 与 Demo Expert 宽度一致。
 
-``K`` 是按时间排列的 clip 数，``L`` 是每个 clip 的帧数。变长
-Demo 通过 ``valid_mask`` 在 batch 内补齐。
+``U`` 是 batch 内唯一 Demo 数，``B`` 是 query 数；inverse index 在编码后
+恢复 ``B``。``K`` 是按时间排列的 clip 数，``L`` 是每个 clip 的帧数。
 """
 
 from __future__ import annotations
@@ -308,6 +310,9 @@ class _LearnedTaskQueries(nn.Module):
 class GlobalDemoEncoder(nn.Module):
     """RGB+State Full Demo -> Global Task Tokens。
 
+    ``forward`` 只消费冻结 S3D 的 clip feature；raw video 必须先显式调用
+    :meth:`encode_video_clips`。因此训练不会误把完整 RGB Demo 搬到 GPU。
+
     首版结构为：
 
     ``S3D clip feature + State temporal feature``
@@ -402,26 +407,62 @@ class GlobalDemoEncoder(nn.Module):
 
     def _validate_inputs(
         self,
-        video: Tensor,
+        video_features: Tensor,
         states: Tensor,
         timestamps: Tensor,
         valid_mask: Tensor,
     ) -> None:
-        """检查核心形状；数值范围和时间顺序由 Processor 保证。"""
-        if video.ndim != 6 or video.shape[3] != 3 or not video.is_floating_point():
-            raise ValueError("Global video 必须是浮点 (B,K,L,3,H,W) Tensor。")
-        if states.shape != (*video.shape[:3], self.config.state_dim) or not states.is_floating_point():
+        """检查冻结 S3D feature 与仍需训练的 State 输入形状。"""
+        if states.ndim != 4 or states.shape[-1] != self.config.state_dim:
             raise ValueError(
                 "Global states 必须为浮点 "
                 f"(B,K,L,{self.config.state_dim}) Tensor。"
             )
-        if timestamps.shape != video.shape[:3] or valid_mask.shape != video.shape[:3]:
-            raise ValueError("timestamps/valid_mask 必须与 video 的 (B,K,L) 一致。")
-        if not all(video.shape[:3]):
+        if not states.is_floating_point():
+            raise ValueError("Global states 必须是浮点 Tensor。")
+        if timestamps.shape != states.shape[:3] or valid_mask.shape != states.shape[:3]:
+            raise ValueError("timestamps/valid_mask 必须与 states 的 (B,K,L) 一致。")
+        if not all(states.shape[:3]):
             raise ValueError("Global Demo 的 batch、clip 数和每 clip 帧数都必须大于 0。")
+
+        if (
+            video_features.shape != (*states.shape[:2], self.video_feature_dim)
+            or not video_features.is_floating_point()
+        ):
+            raise ValueError(
+                "缓存的 Global video_features 必须为浮点 "
+                f"(B,K,{self.video_feature_dim}) Tensor。"
+            )
 
         if torch.any(~valid_mask.flatten(1).any(dim=1)):
             raise ValueError("每条 Demo 至少需要一帧有效 RGB+State Observation。")
+
+    def encode_video_clips(self, video: Tensor, valid_mask: Tensor) -> Tensor:
+        """只执行冻结/可训练视频骨干，返回可离线缓存的 ``(B,K,D_v)``。
+
+        磁盘缓存必须停在这里：后续 State Encoder、RGB/State fusion、Temporal
+        Aggregator 和 Task Queries 均仍属于训练图。
+        """
+        if video.ndim != 6 or video.shape[3] != 3 or not video.is_floating_point():
+            raise ValueError("Global video 必须是浮点 (B,K,L,3,H,W) Tensor。")
+        if valid_mask.shape != video.shape[:3]:
+            raise ValueError("Global video valid_mask 必须为 (B,K,L)。")
+
+        batch_size, num_clips, frames_per_clip = video.shape[:3]
+        flat_video = video.reshape(batch_size * num_clips, frames_per_clip, *video.shape[3:])
+        flat_mask = valid_mask.reshape(batch_size * num_clips, frames_per_clip)
+        backbone_context = (
+            torch.no_grad() if self.config.freeze_video_backbone else nullcontext()
+        )
+        with backbone_context:
+            features = self.video_backbone(flat_video, flat_mask)
+        if features.shape != (batch_size * num_clips, self.video_feature_dim):
+            raise RuntimeError(
+                "video_backbone 必须输出 "
+                f"({batch_size * num_clips},{self.video_feature_dim})，"
+                f"实际为 {tuple(features.shape)}。"
+            )
+        return features.reshape(batch_size, num_clips, self.video_feature_dim)
 
     def _compute_clip_phase(self, timestamps: Tensor, valid_mask: Tensor) -> Tensor:
         """计算每个 clip 中心在完整 Demo 内的连续 phase。"""
@@ -441,39 +482,22 @@ class GlobalDemoEncoder(nn.Module):
 
     def forward(
         self,
-        video: Tensor,
+        video_features: Tensor,
         states: Tensor,
         timestamps: Tensor,
-        valid_mask: Tensor | None = None,
+        valid_mask: Tensor,
     ) -> GlobalEncoderOutput:
-        """编码完整 Demo，返回固定数量的 Global Task Tokens。"""
-        if valid_mask is None:
-            valid_mask = torch.ones(video.shape[:3], dtype=torch.bool, device=video.device)
-        else:
-            valid_mask = valid_mask.to(device=video.device, dtype=torch.bool)
-        timestamps = timestamps.to(device=video.device, dtype=torch.float64)
-        states = states.to(device=video.device)
-        self._validate_inputs(video, states, timestamps, valid_mask)
+        """从冻结 S3D feature 编码完整 Demo，返回可训练的 Global Tokens。"""
+        valid_mask = valid_mask.to(device=states.device, dtype=torch.bool)
+        timestamps = timestamps.to(device=states.device, dtype=torch.float64)
+        self._validate_inputs(video_features, states, timestamps, valid_mask)
 
-        batch_size, num_clips, frames_per_clip = video.shape[:3]
-        flat_video = video.reshape(batch_size * num_clips, frames_per_clip, *video.shape[3:])
+        batch_size, num_clips, frames_per_clip = states.shape[:3]
         flat_states = states.reshape(batch_size * num_clips, frames_per_clip, states.shape[-1])
         flat_times = timestamps.reshape(batch_size * num_clips, frames_per_clip)
         flat_mask = valid_mask.reshape(batch_size * num_clips, frames_per_clip)
 
-        # 冻结骨干时不构建 autograd graph，显著降低整条 Demo 编码的显存。
-        backbone_context = torch.no_grad() if self.config.freeze_video_backbone else nullcontext()
-        with backbone_context:
-            visual_features = self.video_backbone(flat_video, flat_mask)
-        if visual_features.shape != (batch_size * num_clips, self.video_feature_dim):
-            raise RuntimeError(
-                "video_backbone 必须输出 "
-                f"({batch_size * num_clips},{self.video_feature_dim})，"
-                f"实际为 {tuple(visual_features.shape)}。"
-            )
-
         state_features = self.state_encoder(flat_states, flat_times, flat_mask)
-        visual_features = visual_features.reshape(batch_size, num_clips, -1)
         state_features = state_features.reshape(batch_size, num_clips, -1)
 
         valid_fraction = valid_mask.float().mean(dim=-1)
@@ -487,7 +511,7 @@ class GlobalDemoEncoder(nn.Module):
         fused = self.rgb_state_fusion(
             torch.cat(
                 [
-                    visual_features.to(dtype=fusion_dtype),
+                    video_features.to(dtype=fusion_dtype),
                     state_features.to(dtype=fusion_dtype),
                 ],
                 dim=-1,
@@ -507,7 +531,7 @@ class GlobalDemoEncoder(nn.Module):
             batch_size,
             self.config.num_global_tokens,
             dtype=torch.bool,
-            device=video.device,
+            device=states.device,
         )
         temporal_valid = torch.cat([global_mask, clip_mask], dim=1)
 

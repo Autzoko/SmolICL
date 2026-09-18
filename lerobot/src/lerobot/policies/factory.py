@@ -357,7 +357,15 @@ def make_policy(
 
     # Pass dataset_stats to the policy if available (needed for some policies like SARM)
     if ds_meta is not None and hasattr(ds_meta, "stats"):
-        kwargs["dataset_stats"] = ds_meta.stats
+        if cfg.type == "smolvla_icl":
+            # Demo Matcher 与标准 preprocessor 必须读取同一个 canonical State key。
+            # 数据集使用 rename_map 时，直接传原始 stats 会让 Demo normalizer 找不到
+            # observation.state，或与 Current State 的归一化统计发生偏移。
+            from lerobot.processor import rename_stats
+
+            kwargs["dataset_stats"] = rename_stats(ds_meta.stats, rename_map or {})
+        else:
+            kwargs["dataset_stats"] = ds_meta.stats
 
     if ds_meta is not None:
         kwargs["dataset_meta"] = ds_meta

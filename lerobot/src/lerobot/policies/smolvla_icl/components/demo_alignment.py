@@ -7,7 +7,8 @@
 - Query 由 :class:`ObservationHistoryBuffer` 逐帧追加。任意一次匹配只能使用
   当前帧以及此前已经到达的帧，不能接收或读取未来 Observation。
 
-视觉侧直接引用 SmolVLA 已有的 SigLIP 和 connector，不创建第二套视觉权重。
+视觉侧使用一份独立冻结的 SigLIP+connector snapshot。训练期间它只为
+DTW 生成稳定特征，不向 Demo Expert 提供 Local tokens，也不接收 Action Loss。
 本模块假设 Demo 与 Query 具有相同的单调阶段拓扑，只处理速度、停顿和
 小范围 layout/轨迹差异；不处理可选子动作、反向运动或不同路径拓扑。
 """
@@ -16,7 +17,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Self
 
@@ -25,7 +26,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from ..configuration_smolvla_icl import DemoAlignmentConfig
-from .state_normalizer import DemoStateNormalizer, StateNormalizationSignature
+from ..data.state import DemoStateNormalizer, StateNormalizationSignature
 
 
 __all__ = [
@@ -33,7 +34,7 @@ __all__ = [
     "AlignmentResult",
     "DemoAlignmentConfig",
     "DemoEmbeddingCache",
-    "LocalDemoChunk",
+    "LocalDemoWindow",
     "ObservationHistoryBuffer",
     "OnlineDTWMatcher",
     "SmolVLASigLIPHandle",
@@ -79,44 +80,28 @@ class AlignmentResult:
 
 
 @dataclass(frozen=True, slots=True)
-class LocalDemoChunk:
-    """围绕匹配锚点从完整 Demo 中截取的固定长度数据。"""
+class LocalDemoWindow:
+    """Matcher 围绕锚点截取的 State/时间窗口，不包含模型视觉特征。"""
 
-    visual_tokens: Tensor | None
-    visual_embeddings: Tensor
-    states: Tensor
     state_features: Tensor
-    timestamps: Tensor
     relative_time_s: Tensor
     relative_position: Tensor
     phase: Tensor
     valid_mask: Tensor
     source_indices: Tensor
     anchor_position: int
-    demo_anchor_index: int
-    alignment_confidence: float
-    observation_id: int | str | None
-    observation_timestamp: float | None
 
     def to(self, device: torch.device | str) -> Self:
         """返回所有 Tensor 已移动到目标设备的新对象。"""
         target = torch.device(device)
         return type(self)(
-            visual_tokens=self.visual_tokens.to(target) if self.visual_tokens is not None else None,
-            visual_embeddings=self.visual_embeddings.to(target),
-            states=self.states.to(target),
             state_features=self.state_features.to(target),
-            timestamps=self.timestamps.to(target),
             relative_time_s=self.relative_time_s.to(target),
             relative_position=self.relative_position.to(target),
             phase=self.phase.to(target),
             valid_mask=self.valid_mask.to(target),
             source_indices=self.source_indices.to(target),
             anchor_position=self.anchor_position,
-            demo_anchor_index=self.demo_anchor_index,
-            alignment_confidence=self.alignment_confidence,
-            observation_id=self.observation_id,
-            observation_timestamp=self.observation_timestamp,
         )
 
 
@@ -482,21 +467,18 @@ def load_smolvla_siglip(
 
 @dataclass
 class DemoEmbeddingCache:
-    """在 rollout 前一次性构建的完整 Demo 缓存。"""
+    """冻结 ``E_match`` 的 DTW 特征及 Local State/时间索引缓存。"""
 
     config: DemoAlignmentConfig
     state_normalizer: DemoStateNormalizer
     timestamps: Tensor
     valid_mask: Tensor
     anchor_indices: Tensor
-    visual_frame_embeddings: Tensor
     state_frame_features: Tensor
     visual_chunk_embeddings: Tensor
     state_chunk_embeddings: Tensor
     chunk_valid_mask: Tensor
     chunk_valid_fraction: Tensor
-    states: Tensor
-    visual_tokens: Tensor | None = None
 
     @classmethod
     @torch.no_grad()
@@ -511,8 +493,10 @@ class DemoEmbeddingCache:
         config: DemoAlignmentConfig | None = None,
         valid_mask: Tensor | None = None,
     ) -> Self:
-        """用共享 SigLIP 编码完整 Demo，并在内部归一化 raw State。"""
+        """用冻结 Matcher SigLIP 编码完整 Demo 的对齐特征。"""
         cfg = config or DemoAlignmentConfig()
+        if not siglip.frozen:
+            raise ValueError("Demo Matcher 只能使用冻结的 SigLIP snapshot。")
         siglip._validate_images(preprocessed_images)
         if len(raw_states) != len(preprocessed_images) or len(timestamps) != len(preprocessed_images):
             raise ValueError("Demo image/state/timestamp 的时间长度必须一致。")
@@ -532,14 +516,12 @@ class DemoEmbeddingCache:
 
         cache_device = torch.device(cfg.cache_device)
         frame_batches: list[Tensor] = []
-        token_batches: list[Tensor] = []
         for start in range(0, len(safe_images), cfg.demo_encode_batch_size):
             tokens = siglip.encode_visual_tokens(
                 safe_images[start : start + cfg.demo_encode_batch_size]
             )
-            # Matcher 使用未归一化的 pooled feature 构建检索特征，
-            # 所需的 L2 归一化稍后单独执行。Local Encoder 则读取下方
-            # 缓存的完整空间 tokens；两条路径共享同一次视觉前向。
+            # Matcher 只保存 pooled feature；模型使用的 spatial tokens
+            # 由 Policy 通过独立的 E_vision 路径维护。
             frame_batches.append(
                 pool_visual_tokens(
                     tokens,
@@ -547,11 +529,6 @@ class DemoEmbeddingCache:
                     eps=cfg.eps,
                 ).to(cache_device)
             )
-            if cfg.cache_visual_tokens:
-                # 每个 batch 编码完成后立刻移到 cache device，避免整条 Demo
-                # 的空间 tokens 同时占用视觉模型所在设备。
-                token_batches.append(tokens.detach().to(cache_device))
-
         return cls.from_embeddings(
             torch.cat(frame_batches),
             raw_states,
@@ -559,7 +536,6 @@ class DemoEmbeddingCache:
             state_normalizer=state_normalizer,
             config=cfg,
             valid_mask=frame_valid,
-            visual_tokens=torch.cat(token_batches) if token_batches else None,
         )
 
     @classmethod
@@ -572,7 +548,6 @@ class DemoEmbeddingCache:
         state_normalizer: DemoStateNormalizer,
         config: DemoAlignmentConfig | None = None,
         valid_mask: Tensor | None = None,
-        visual_tokens: Tensor | None = None,
     ) -> Self:
         """从已经分批编码好的帧特征构建缓存。
 
@@ -586,10 +561,6 @@ class DemoEmbeddingCache:
         num_frames = len(timestamps)
         if num_frames == 0 or len(visual_frame_embeddings) != num_frames or len(raw_states) != num_frames:
             raise ValueError("Demo 三种输入必须非空且时间长度一致。")
-        if visual_tokens is not None:
-            if visual_tokens.ndim != 3 or len(visual_tokens) != num_frames:
-                raise ValueError("visual_tokens 必须是与 Demo 对齐的 (T,P,D) Tensor。")
-
         device = torch.device(cfg.cache_device)
         times = timestamps.detach().to(device=device, dtype=torch.float64)
         visual_values = visual_frame_embeddings.detach().to(device=device, dtype=torch.float32)
@@ -621,16 +592,17 @@ class DemoEmbeddingCache:
             eps=cfg.eps,
         )
 
-        # 完整 Demo 始终留在 frame cache，供 Local Demo 以原始时间分辨率读取；
-        # DTW 只在与 Query 重规划频率一致的锚点上建立滚动窗口。
+        # State/时间保留原始时间分辨率供 Local 窗口读取；DTW 视觉特征只在
+        # 与 Query 重规划频率一致的锚点上建立滚动窗口，逐帧 pooled feature
+        # 构建完成后即丢弃，避免它被误当成模型 E_vision 的 Local 输入。
         alignment_indices = _select_alignment_indices(times, cfg.alignment_hz, cfg.eps)
         alignment_times = times[alignment_indices]
         alignment_valid = frame_valid[alignment_indices]
         alignment_states = state_values[alignment_indices]
         alignment_visual = visual_values[alignment_indices]
         if cfg.normalize_visual_features:
-            # 检索使用单位向量，Local Encoder 继续使用上面保留的
-            # 原始 pooled feature，避免模型输入被 Matcher 的距离度量绑定。
+            # 归一化只服务于 Matcher 距离；Local Encoder 的视觉输入由
+            # Policy 持有的独立 E_vision cache 提供。
             alignment_visual = F.normalize(alignment_visual, dim=-1, eps=cfg.eps)
         matching_state_features = extract_matching_state_features(
             alignment_states,
@@ -653,31 +625,17 @@ class DemoEmbeddingCache:
             normalize=False,
         )
 
-        cached_tokens = None
-        if cfg.cache_visual_tokens and visual_tokens is not None:
-            tokens = visual_tokens.detach().to(device)
-            if torch.any(~torch.isfinite(tokens[frame_valid])):
-                raise ValueError("有效 Demo 帧的视觉 tokens 必须只包含有限值。")
-            cached_tokens = torch.where(
-                frame_valid[:, None, None],
-                tokens,
-                torch.zeros_like(tokens),
-            )
-
         return cls(
             config=cfg,
             state_normalizer=state_normalizer,
             timestamps=times,
             valid_mask=frame_valid,
             anchor_indices=alignment_indices,
-            visual_frame_embeddings=visual_values,
             state_frame_features=state_features,
             visual_chunk_embeddings=visual_chunks,
             state_chunk_embeddings=state_chunks,
             chunk_valid_mask=visual_valid & state_valid,
             chunk_valid_fraction=torch.minimum(visual_fraction, state_fraction),
-            states=state_values,
-            visual_tokens=cached_tokens,
         )
 
     @property
@@ -687,6 +645,54 @@ class DemoEmbeddingCache:
     @property
     def num_chunks(self) -> int:
         return len(self.visual_chunk_embeddings)
+
+    def to_serializable(self) -> dict[str, Any]:
+        """导出不含模型对象的 Matcher CPU payload。"""
+        tensor_names = (
+            "timestamps",
+            "valid_mask",
+            "anchor_indices",
+            "state_frame_features",
+            "visual_chunk_embeddings",
+            "state_chunk_embeddings",
+            "chunk_valid_mask",
+            "chunk_valid_fraction",
+        )
+        tensors = {name: getattr(self, name).detach().cpu() for name in tensor_names}
+        return {
+            "version": 2,
+            "config": asdict(self.config),
+            "state_normalizer": {
+                "mean": self.state_normalizer.mean.detach().cpu(),
+                "std": self.state_normalizer.std.detach().cpu(),
+                "eps": self.state_normalizer.eps,
+            },
+            "tensors": tensors,
+        }
+
+    @classmethod
+    def from_serializable(cls, payload: dict[str, Any]) -> Self:
+        """从 :meth:`to_serializable` 的纯数据 payload 恢复缓存。"""
+        if payload.get("version") != 2:
+            raise ValueError("不支持的 DemoEmbeddingCache 磁盘版本。")
+        normalizer_payload = payload["state_normalizer"]
+        tensors = payload["tensors"]
+        return cls(
+            config=DemoAlignmentConfig(**payload["config"]),
+            state_normalizer=DemoStateNormalizer(
+                mean=normalizer_payload["mean"],
+                std=normalizer_payload["std"],
+                eps=float(normalizer_payload["eps"]),
+            ),
+            timestamps=tensors["timestamps"],
+            valid_mask=tensors["valid_mask"],
+            anchor_indices=tensors["anchor_indices"],
+            state_frame_features=tensors["state_frame_features"],
+            visual_chunk_embeddings=tensors["visual_chunk_embeddings"],
+            state_chunk_embeddings=tensors["state_chunk_embeddings"],
+            chunk_valid_mask=tensors["chunk_valid_mask"],
+            chunk_valid_fraction=tensors["chunk_valid_fraction"],
+        )
 
     def timestamps_to_phase(self, timestamps: Tensor) -> Tensor:
         """按完整 Demo 的有效时间范围把 timestamp 映射到 ``[0,1]``。"""
@@ -710,18 +716,12 @@ class DemoEmbeddingCache:
             state_normalization_signature=self.state_normalizer.signature,
         )
 
-    def extract_local_chunk(self, alignment: AlignmentResult | int) -> LocalDemoChunk:
-        """从完整 Demo 中截取历史+锚点+未来；这里允许使用 Demo 未来。"""
+    def extract_local_window(self, alignment: AlignmentResult | int) -> LocalDemoWindow:
+        """截取 anchor 周围的 State/时间窗口；模型视觉特征由 Policy 单独读取。"""
         if isinstance(alignment, AlignmentResult):
             anchor = alignment.demo_observation_index
-            confidence = alignment.confidence
-            observation_id = alignment.observation_id
-            observation_timestamp: float | None = alignment.observation_timestamp
         else:
             anchor = int(alignment)
-            confidence = 1.0
-            observation_id = None
-            observation_timestamp = None
         if not 0 <= anchor < self.num_frames:
             raise IndexError("Local Demo 锚点越界。")
 
@@ -744,10 +744,7 @@ class DemoEmbeddingCache:
             expanded_mask = local_valid.reshape(len(local_valid), *([1] * (output.ndim - 1)))
             return torch.where(expanded_mask, output, torch.zeros_like(output))
 
-        visual_embeddings = gather_with_padding(self.visual_frame_embeddings)
-        states = gather_with_padding(self.states)
         state_features = gather_with_padding(self.state_frame_features)
-        local_tokens = gather_with_padding(self.visual_tokens) if self.visual_tokens is not None else None
 
         # Local Demo 使用完整 Demo 的原始时间轴，而非较稀疏的 Matcher 频率。
         # 越界 padding 没有真实 timestamp，才用相邻帧的中位时间间隔外推。
@@ -762,22 +759,14 @@ class DemoEmbeddingCache:
         local_timestamps = self.timestamps[anchor] + relative_time.to(self.timestamps.dtype)
         local_timestamps[in_bounds] = self.timestamps[requested[in_bounds]]
 
-        return LocalDemoChunk(
-            visual_tokens=local_tokens,
-            visual_embeddings=visual_embeddings,
-            states=states,
+        return LocalDemoWindow(
             state_features=state_features,
-            timestamps=local_timestamps,
             relative_time_s=relative_time,
             relative_position=relative_indices.float() / self.config.local_chunk_size,
             phase=self.timestamps_to_phase(local_timestamps),
             valid_mask=local_valid,
             source_indices=source_indices,
             anchor_position=anchor_position,
-            demo_anchor_index=anchor,
-            alignment_confidence=confidence,
-            observation_id=observation_id,
-            observation_timestamp=observation_timestamp,
         )
 
     def to(self, device: torch.device | str) -> Self:
@@ -787,17 +776,13 @@ class DemoEmbeddingCache:
             "timestamps",
             "valid_mask",
             "anchor_indices",
-            "visual_frame_embeddings",
             "state_frame_features",
             "visual_chunk_embeddings",
             "state_chunk_embeddings",
             "chunk_valid_mask",
             "chunk_valid_fraction",
-            "states",
         ):
             setattr(self, name, getattr(self, name).to(target))
-        if self.visual_tokens is not None:
-            self.visual_tokens = self.visual_tokens.to(target)
         return self
 
 
@@ -1131,9 +1116,9 @@ class OnlineDTWMatcher:
     def update_and_extract(
         self,
         query: AlignmentChunkEmbedding,
-    ) -> tuple[AlignmentResult, LocalDemoChunk]:
+    ) -> tuple[AlignmentResult, LocalDemoWindow]:
         result = self.update(query)
-        return result, self.demo_cache.extract_local_chunk(result)
+        return result, self.demo_cache.extract_local_window(result)
 
     def _previous_cost(self, demo_index: int) -> Tensor:
         offset = demo_index - self._previous_start
