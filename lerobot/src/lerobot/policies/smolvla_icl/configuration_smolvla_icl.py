@@ -22,13 +22,10 @@ class GlobalEncoderConfig:
     Tokens。输出宽度直接对齐 Demo Expert，因此默认为 SmolVLA
     VLM hidden size 960 乘以 0.75，即 720。
 
-    ``backbone_name`` 暂时只支持 ``"s3d"``。后续的 MoViNet、
-    VideoMAE 和 Swin3D 会通过相同的 backbone adapter 接口接入，
-    不改变上层 Temporal Aggregator 和 Demo Expert 的数据契约。
+    当前实现固定使用 S3D；如果后续接入其他视频骨干，应增加独立的
+    backbone adapter，而不是保留尚未生效的名称参数。
     """
 
-    # 视频骨干。首版只实现 TorchVision S3D。
-    backbone_name: str = "s3d"
     pretrained_backbone: bool = True
     freeze_video_backbone: bool = True
 
@@ -42,6 +39,9 @@ class GlobalEncoderConfig:
     # 16 帧无重叠分段；末尾不足一个 clip 的部分用 valid mask 补齐。
     clip_length: int = 16
     clip_stride: int = 16
+    # 注册或离线缓存 Demo 时，每次送入 S3D 的 clip 数。完整视频保留在
+    # CPU，只逐批上传，避免长 Demo 在 ``set_demo`` 阶段产生显存峰值。
+    clip_encode_batch_size: int = 2
 
     # Global State 路径的输入维度对齐 SmolVLA 的 max_state_dim。
     state_dim: int = 32
@@ -65,8 +65,6 @@ class GlobalEncoderConfig:
 
     def __post_init__(self) -> None:
         """验证所有会影响张量形状或数值稳定性的配置。"""
-        if self.backbone_name != "s3d":
-            raise ValueError("当前 Global Encoder 只支持 backbone_name='s3d'。")
         if len(self.image_size) != 2 or any(size <= 0 for size in self.image_size):
             raise ValueError("image_size 必须是两个正整数。")
         if len(self.image_mean) != 3 or len(self.image_std) != 3:
@@ -88,6 +86,7 @@ class GlobalEncoderConfig:
             "temporal_num_heads": self.temporal_num_heads,
             "num_global_tokens": self.num_global_tokens,
             "output_dim": self.output_dim,
+            "clip_encode_batch_size": self.clip_encode_batch_size,
         }
         if any(value < 1 for value in positive_ints.values()):
             raise ValueError(f"{', '.join(positive_ints)} 都必须大于 0。")
@@ -197,7 +196,7 @@ class DemoAlignmentConfig:
     # 匹配完成后，从完整 Demo 中读取固定长度的 Local Chunk。
     # anchor 在 Local Chunk 中的位置由归一化比例决定：默认 0.4
     # 表示 anchor 之前保留约 40% 的历史，anchor 及其后内容占约 60%。
-    local_chunk_size: int = 100
+    local_chunk_size: int = 48
     local_anchor_position_ratio: float = 0.4
     eps: float = 1e-6
 
@@ -220,9 +219,7 @@ class DemoAlignmentConfig:
         if not math.isfinite(control_hz) or control_hz <= 0:
             raise ValueError("控制频率必须是有限正数。")
         if n_action_steps < 1 or query_window_replans < 2:
-            raise ValueError(
-                "action steps 必须大于 0，窗口至少包含 2 次重规划。"
-            )
+            raise ValueError("action steps 必须大于 0，窗口至少包含 2 次重规划。")
         if "alignment_hz" in kwargs or "window_duration_s" in kwargs:
             raise ValueError("for_action_chunking 会自动设置 alignment_hz 和 window_duration_s。")
 
@@ -256,13 +253,10 @@ class DemoAlignmentConfig:
             raise ValueError("视觉和 State 距离权重不能同时为 0。")
         if self.rgb_only and self.vision_distance_weight == 0:
             raise ValueError("rgb_only=True 时 vision_distance_weight 必须大于 0。")
-        if len(set(self.matching_state_excluded_indices)) != len(
-            self.matching_state_excluded_indices
-        ):
+        if len(set(self.matching_state_excluded_indices)) != len(self.matching_state_excluded_indices):
             raise ValueError("matching_state_excluded_indices 不能包含重复索引。")
         if self.matching_state_velocity_scale is not None and any(
-            not math.isfinite(scale) or scale <= 0
-            for scale in self.matching_state_velocity_scale
+            not math.isfinite(scale) or scale <= 0 for scale in self.matching_state_velocity_scale
         ):
             raise ValueError("matching_state_velocity_scale 的每一维都必须是有限正数。")
         if self.dtw_forward_window < 0 or self.dtw_max_advance < 1:
@@ -315,9 +309,18 @@ class SmolVLAICLConfig(SmolVLAConfig):
     # Matcher 使用另一份冻结 snapshot，不受该开关影响。
     freeze_vision_encoder: bool = False
 
+    # Local Demo 一次最多送入视觉编码器的帧数。Local Chunk 的语义窗口
+    # 保持不变，只在 GPU 上按小批次编码，避免 B*T 张图同时展开。
+    local_vision_encode_batch_size: int = 8
+    # 训练时重算视觉前向以换取更低的激活显存；rollout/no_grad 不启用。
+    local_vision_gradient_checkpointing: bool = True
+
     # 训练数据只保存 demo_id/query_anchor/local_anchor；该目录只保存
     # 冻结 S3D 的 Global clip feature。Local RGB 由 Dataset 按 anchor 读取。
     training_demo_cache_dir: str | None = None
+    # episode 级数据协议：唯一确定 train/val/test 以及 Demo/Query 划分。
+    # 训练数据工厂不再使用 LeRobot 通用 eval_split 重新划分。
+    data_manifest_path: str | None = None
     # 离线 DTW 配对表。它只记录 Query episode/frame 到
     # ``demo_id + local_anchor`` 的映射，不保存任何 RGB 或模型 token。
     pairing_sidecar_path: str | None = None
@@ -335,10 +338,11 @@ class SmolVLAICLConfig(SmolVLAConfig):
         super().__post_init__()
         if self.training_demo_cache_memory_entries < 0:
             raise ValueError("training_demo_cache_memory_entries 不能为负数。")
+        if self.local_vision_encode_batch_size < 1:
+            raise ValueError("local_vision_encode_batch_size 必须大于 0。")
         if self.attention_mode != "cross_attn" or self.self_attn_every_n_layers != 2:
             raise ValueError(
-                "SmolVLA-ICL 首版要求 attention_mode='cross_attn' 且 "
-                "self_attn_every_n_layers=2。"
+                "SmolVLA-ICL 首版要求 attention_mode='cross_attn' 且 self_attn_every_n_layers=2。"
             )
         if self.num_vlm_layers != 16 or not math.isclose(
             self.expert_width_multiplier,
@@ -347,8 +351,7 @@ class SmolVLAICLConfig(SmolVLAConfig):
             raise ValueError("SmolVLA-ICL 首版固定使用 16 层 VLM 和 0.75 Expert 宽度。")
         if self.num_expert_layers > 0:
             raise ValueError(
-                "SmolVLA-ICL 首版要求 num_expert_layers<=0，使 Action/Demo Expert "
-                "与 VLM 保持相同层数。"
+                "SmolVLA-ICL 首版要求 num_expert_layers<=0，使 Action/Demo Expert 与 VLM 保持相同层数。"
             )
         if not self.use_cache:
             raise NotImplementedError("SmolVLA-ICL 推理固定使用 P/G/L condition cache。")
@@ -357,9 +360,7 @@ class SmolVLAICLConfig(SmolVLAConfig):
         if self.rtc_config is not None and self.rtc_config.enabled:
             raise NotImplementedError("SmolVLA-ICL 尚未接入 RTC。")
         if self.adapt_to_pi_aloha:
-            raise NotImplementedError(
-                "SmolVLA-ICL 尚未统一 ALOHA Prefix 与 Demo Matcher 的 State 坐标系。"
-            )
+            raise NotImplementedError("SmolVLA-ICL 尚未统一 ALOHA Prefix 与 Demo Matcher 的 State 坐标系。")
         if self.global_encoder.output_dim != self.local_encoder.output_dim:
             raise ValueError("Global/Local Encoder 的 output_dim 必须一致。")
         if (
@@ -367,9 +368,7 @@ class SmolVLAICLConfig(SmolVLAConfig):
             or self.local_encoder.state_dim != self.max_state_dim
         ):
             raise ValueError("Global/Local Encoder state_dim 必须等于 max_state_dim。")
-        if not math.isfinite(self.global_cross_gate_init) or not math.isfinite(
-            self.local_cross_gate_init
-        ):
+        if not math.isfinite(self.global_cross_gate_init) or not math.isfinite(self.local_cross_gate_init):
             raise ValueError("Cross-Attention gate 初始值必须是有限数。")
 
     def validate_features(self) -> None:

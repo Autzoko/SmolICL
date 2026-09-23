@@ -16,7 +16,6 @@ from torch import Tensor, nn
 from ..common.vla_utils import make_att_2d_masks
 from ..smolvla.smolvlm_with_expert import SmolVLMWithExpertModel, apply_rope
 
-
 __all__ = [
     "CrossAttentionMasks",
     "FourRegionInputs",
@@ -108,17 +107,20 @@ class FourRegionInputs:
             raise ValueError("local_anchor_positions 必须为 (B,) Tensor。")
         if len({hidden.shape[-1] for hidden in hiddens[1:]}) != 1:
             raise ValueError("Global、Local 和 Action hidden width 必须一致。")
-        if len(
-            {
-                tensor.device
-                for tensor in (
-                    *hiddens,
-                    *masks,
-                    self.prefix_block_mask,
-                    self.local_anchor_positions,
-                )
-            }
-        ) != 1:
+        if (
+            len(
+                {
+                    tensor.device
+                    for tensor in (
+                        *hiddens,
+                        *masks,
+                        self.prefix_block_mask,
+                        self.local_anchor_positions,
+                    )
+                }
+            )
+            != 1
+        ):
             raise ValueError("P/G/L/A hidden 和 mask 必须位于同一设备。")
 
     @property
@@ -280,9 +282,7 @@ class SmolVLMWithDemoExpertModel(SmolVLMWithExpertModel):
             or self.attention_mode != "cross_attn"
             or self.self_attn_every_n_layers != 2
         ):
-            raise ValueError(
-                "SmolVLA-ICL 要求 VLM/Expert 等深，且固定采用偶数 Union、奇数 Cross。"
-            )
+            raise ValueError("SmolVLA-ICL 要求 VLM/Expert 等深，且固定采用偶数 Union、奇数 Cross。")
         text_config = self.config.text_config
         expert_config = self.lm_expert.config
 
@@ -694,10 +694,13 @@ class SmolVLMWithDemoExpertModel(SmolVLMWithExpertModel):
             action_layer.self_attn.head_dim,
         )
         # 与官方 Cross-Attention 一致，Action Query 的 RoPE 从 0 开始。
-        action_cross_position_ids = action_position_ids - action_position_ids.min(
-            dim=1,
-            keepdim=True,
-        ).values
+        action_cross_position_ids = (
+            action_position_ids
+            - action_position_ids.min(
+                dim=1,
+                keepdim=True,
+            ).values
+        )
         action_query = apply_rope(action_query, action_cross_position_ids)
         prefix_key, prefix_value = self._project_prefix_kv_for_action(
             prefix_hidden,
@@ -739,10 +742,13 @@ class SmolVLMWithDemoExpertModel(SmolVLMWithExpertModel):
             layer_idx,
             local_position_ids,
         )
-        action_cross_position_ids = action_position_ids - action_position_ids.min(
-            dim=1,
-            keepdim=True,
-        ).values
+        action_cross_position_ids = (
+            action_position_ids
+            - action_position_ids.min(
+                dim=1,
+                keepdim=True,
+            ).values
+        )
         query = apply_rope(query, action_cross_position_ids)
 
         attention_output = self.eager_attention_forward(
@@ -793,9 +799,6 @@ class SmolVLMWithDemoExpertModel(SmolVLMWithExpertModel):
         组成一次 Attention。输出按区域切回后，分别经过各自的输出投影、
         残差和 MLP；不同分支从始至终不共享 Transformer 参数。
         """
-        action_layer = self._get_action_layer(layer_idx)
-        demo_layer = self._get_demo_layer(layer_idx)
-
         demo_hidden = torch.cat([hidden.global_hidden, hidden.local_hidden], dim=1)
         prefix_qkv = self._project_vlm_qkv(hidden.prefix_hidden, layer_idx)
         demo_qkv = self._project_demo_qkv(demo_hidden, layer_idx)
@@ -1152,10 +1155,13 @@ class SmolVLMWithDemoExpertModel(SmolVLMWithExpertModel):
         if action_hidden.shape[:2] != cache.action_valid_mask.shape:
             raise ValueError("Action hidden 必须与 condition cache 的 batch/序列长度一致。")
         batch_size = action_hidden.shape[0]
-        action_cross_position_ids = cache.action_position_ids - cache.action_position_ids.min(
-            dim=1,
-            keepdim=True,
-        ).values
+        action_cross_position_ids = (
+            cache.action_position_ids
+            - cache.action_position_ids.min(
+                dim=1,
+                keepdim=True,
+            ).values
+        )
 
         for layer_idx, layer_cache in enumerate(cache.layers):
             action_layer = self._get_action_layer(layer_idx)
@@ -1212,14 +1218,12 @@ class SmolVLMWithDemoExpertModel(SmolVLMWithExpertModel):
                 layer_cache.cross_prefix_key,
                 layer_cache.cross_prefix_value,
             )
-            prefix_attention = prefix_attention * cache.action_from_prefix_mask.any(
-                dim=-1
-            ).unsqueeze(-1)
+            prefix_attention = prefix_attention * cache.action_from_prefix_mask.any(dim=-1).unsqueeze(-1)
             prefix_attention = prefix_attention.to(dtype=action_layer.self_attn.o_proj.weight.dtype)
             action_hidden = action_hidden + action_layer.self_attn.o_proj(prefix_attention)
-            action_hidden = action_hidden * cache.action_valid_mask.to(
-                dtype=action_hidden.dtype
-            ).unsqueeze(-1)
+            action_hidden = action_hidden * cache.action_valid_mask.to(dtype=action_hidden.dtype).unsqueeze(
+                -1
+            )
 
             # A<-L：使用已经读取 P' 的 Action hidden 重新生成 Query。
             adapter = self.action_from_local[str(layer_idx)]
@@ -1239,18 +1243,12 @@ class SmolVLMWithDemoExpertModel(SmolVLMWithExpertModel):
                 layer_cache.cross_local_key,
                 layer_cache.cross_local_value,
             )
-            local_attention = adapter.o_proj(
-                local_attention.to(dtype=adapter.o_proj.weight.dtype)
+            local_attention = adapter.o_proj(local_attention.to(dtype=adapter.o_proj.weight.dtype))
+            local_attention = local_attention * cache.action_from_local_mask.any(dim=-1).unsqueeze(-1)
+            action_hidden = action_hidden + adapter.gate.to(dtype=local_attention.dtype) * local_attention
+            action_hidden = action_hidden * cache.action_valid_mask.to(dtype=action_hidden.dtype).unsqueeze(
+                -1
             )
-            local_attention = local_attention * cache.action_from_local_mask.any(
-                dim=-1
-            ).unsqueeze(-1)
-            action_hidden = action_hidden + adapter.gate.to(
-                dtype=local_attention.dtype
-            ) * local_attention
-            action_hidden = action_hidden * cache.action_valid_mask.to(
-                dtype=action_hidden.dtype
-            ).unsqueeze(-1)
             action_hidden = self.finish_action_cross_layer(
                 action_hidden,
                 layer_idx,
@@ -1388,9 +1386,10 @@ def build_region_position_ids(inputs: FourRegionInputs) -> RegionPositionIds:
     """
     prefix = _valid_token_position_ids(inputs.prefix_valid_mask)
     global_demo = _slot_position_ids(inputs.global_valid_mask)
-    local_demo = _slot_position_ids(inputs.local_valid_mask) - inputs.local_anchor_positions.to(
-        dtype=torch.long
-    )[:, None]
+    local_demo = (
+        _slot_position_ids(inputs.local_valid_mask)
+        - inputs.local_anchor_positions.to(dtype=torch.long)[:, None]
+    )
     prefix_length = _as_bool(inputs.prefix_valid_mask).long().sum(dim=1, keepdim=True)
     action = prefix_length + _valid_token_position_ids(inputs.action_valid_mask)
     return RegionPositionIds(

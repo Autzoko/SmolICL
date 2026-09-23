@@ -355,11 +355,11 @@ Repeat:       8 Macro Blocks for a 16-layer backbone
 
 首版采用 RGB+State 的在线受限 DTW，再围绕 $\hat j_t$ 提取固定长度的 Local Chunk。
 `local_chunk_size` 决定总长度，`local_anchor_position_ratio` 决定锚点在
-Local Chunk 中的位置。默认值为 100 和 0.4，即提取约 40% 历史与
+Local Chunk 中的位置。默认值为 48 和 0.4，即提取约 40% 历史与
 60% 当前/未来：
 
 \[
-D_{\mathrm{local}}=D[\hat j_t-40:\hat j_t+60].
+D_{\mathrm{local}}=D[\hat j_t-19:\hat j_t+29].
 \]
 
 外部对齐提供长视频搜索先验，Cross-Attention 在候选窗口内部执行软选择。二者分别解决全局检索和局部细粒度对应。
@@ -374,6 +374,17 @@ D_{\mathrm{local}}=D[\hat j_t-40:\hat j_t+60].
 | Noisy Action | 每个去噪积分步 | 持续变化 |
 
 因此在一次 action chunk 的多步去噪中，\(P\)、\(G\)、\(L\) 都是条件，只有 \(A_t\) 随积分更新。机械臂执行部分动作并重新观测后，再同步更新当前 Prefix 和匹配到的 Local Chunk。
+
+训练时 Local RGB 不能缓存模型视觉 token，因为 \(E_{\mathrm{vision}}\) 需要接收
+Action Loss。Local RGB 在 DataLoader 中保持 uint8，进入 Policy 后按小批次完成
+归一化、SigLIP 编码和 spatial pooling；该完整单元使用 activation checkpointing，
+使反向传播前只保留每帧压缩后的视觉向量。rollout 权重固定后，`set_demo`
+只缓存完成 spatial pooling 的逐帧 visual hidden（默认放在 CPU），不重复保存
+spatial tokens 或无效的 mean-pooled embedding。
+
+Global Demo 注册和离线缓存也不把所有 S3D clips 一次性搬到 GPU：完整
+clip tensor 保留在 CPU，按 `clip_encode_batch_size` 编码并只在 GPU 上
+拼接体积较小的 clip features，再进入可训练的 State/Fusion/Temporal 路径。
 
 ### 2.9 防止忽略 Demo
 

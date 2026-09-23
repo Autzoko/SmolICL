@@ -13,10 +13,9 @@ from typing import Any
 
 import torch
 from torch import Tensor
-from torch.nn import functional as F
+from torch.nn import functional as F  # noqa: N812
 
 from lerobot.utils.constants import OBS_STATE
-
 
 StateNormalizationSignature = tuple[tuple[float, ...], tuple[float, ...], float]
 
@@ -123,8 +122,6 @@ class DemoStateNormalizer:
     ) -> Tensor:
         """先归一化真实 State，再将最后一维右侧补到 ``target_dim``。"""
         if target_dim < self.state_dim:
-            raise ValueError(
-                f"target_dim={target_dim} 小于真实 State 维度 {self.state_dim}。"
-            )
+            raise ValueError(f"target_dim={target_dim} 小于真实 State 维度 {self.state_dim}。")
         normalized = self.normalize(states, valid_mask=valid_mask)
         return F.pad(normalized, (0, target_dim - self.state_dim))

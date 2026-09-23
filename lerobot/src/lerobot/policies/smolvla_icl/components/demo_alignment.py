@@ -23,11 +23,10 @@ from typing import Any, Self
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
+from torch.nn import functional as F  # noqa: N812
 
 from ..configuration_smolvla_icl import DemoAlignmentConfig
 from ..data.state import DemoStateNormalizer, StateNormalizationSignature
-
 
 __all__ = [
     "AlignmentChunkEmbedding",
@@ -156,12 +155,7 @@ def extract_state_features(
     ``previous_state`` 只用于滚动窗口首帧的速度，且必须来自该窗口之前，
     所以该函数不会引入未来信息。
     """
-    if (
-        states.ndim != 2
-        or states.shape[0] == 0
-        or states.shape[1] == 0
-        or not states.is_floating_point()
-    ):
+    if states.ndim != 2 or states.shape[0] == 0 or states.shape[1] == 0 or not states.is_floating_point():
         raise ValueError("states 必须是非空浮点 (T,D) Tensor。")
     if timestamps.ndim != 1 or timestamps.shape[0] != states.shape[0]:
         raise ValueError("timestamps 必须是与 states 对齐的 (T,) Tensor。")
@@ -257,9 +251,7 @@ def extract_matching_state_features(
     for index in excluded_indices:
         resolved = index + state_dim if index < 0 else index
         if not 0 <= resolved < state_dim:
-            raise ValueError(
-                f"State 排除索引 {index} 超出有效范围 [-{state_dim}, {state_dim - 1}]。"
-            )
+            raise ValueError(f"State 排除索引 {index} 超出有效范围 [-{state_dim}, {state_dim - 1}]。")
         resolved_excluded.add(resolved)
 
     kept_indices = [index for index in range(state_dim) if index not in resolved_excluded]
@@ -272,9 +264,7 @@ def extract_matching_state_features(
     if velocity_scale is not None:
         scale = torch.as_tensor(velocity_scale, device=velocity.device, dtype=velocity.dtype)
         if scale.ndim != 1 or scale.shape[0] != velocity.shape[1]:
-            raise ValueError(
-                "velocity_scale 必须是一维 Tensor，长度等于排除指定维度后的 State 维数。"
-            )
+            raise ValueError("velocity_scale 必须是一维 Tensor，长度等于排除指定维度后的 State 维数。")
         if torch.any(~torch.isfinite(scale)) or torch.any(scale <= 0):
             raise ValueError("velocity_scale 必须只包含有限正数。")
         velocity = velocity / scale
@@ -517,9 +507,7 @@ class DemoEmbeddingCache:
         cache_device = torch.device(cfg.cache_device)
         frame_batches: list[Tensor] = []
         for start in range(0, len(safe_images), cfg.demo_encode_batch_size):
-            tokens = siglip.encode_visual_tokens(
-                safe_images[start : start + cfg.demo_encode_batch_size]
-            )
+            tokens = siglip.encode_visual_tokens(safe_images[start : start + cfg.demo_encode_batch_size])
             # Matcher 只保存 pooled feature；模型使用的 spatial tokens
             # 由 Policy 通过独立的 E_vision 路径维护。
             frame_batches.append(
@@ -753,9 +741,9 @@ class DemoEmbeddingCache:
         else:
             demo_period_s = 1.0 / self.config.alignment_hz
         relative_time = relative_indices.float() * demo_period_s
-        relative_time[in_bounds] = (
-            self.timestamps[requested[in_bounds]] - self.timestamps[anchor]
-        ).to(relative_time.dtype)
+        relative_time[in_bounds] = (self.timestamps[requested[in_bounds]] - self.timestamps[anchor]).to(
+            relative_time.dtype
+        )
         local_timestamps = self.timestamps[anchor] + relative_time.to(self.timestamps.dtype)
         local_timestamps[in_bounds] = self.timestamps[requested[in_bounds]]
 
@@ -888,9 +876,7 @@ class ObservationHistoryBuffer:
             self._visual_dim = int(visual.shape[0])
             self._state_dim = int(state.shape[0])
         elif visual.shape[0] != self._visual_dim or state.shape[0] != self._state_dim:
-            raise ValueError(
-                "Observation 的视觉和 State 特征维度必须在同一 episode 内保持一致。"
-            )
+            raise ValueError("Observation 的视觉和 State 特征维度必须在同一 episode 内保持一致。")
 
         if frame_valid and (torch.any(~torch.isfinite(visual)) or torch.any(~torch.isfinite(state))):
             raise ValueError("有效 Observation 必须只包含有限的视觉和 State 特征。")
@@ -1030,9 +1016,7 @@ class OnlineDTWMatcher:
         if len(valid_indices) == 0:
             raise ValueError("Demo 中没有有效 Chunk。")
         start = int(valid_indices[0]) if start_index is None else int(start_index)
-        if not 0 <= start < self.demo_cache.num_chunks or not bool(
-            self.demo_cache.chunk_valid_mask[start]
-        ):
+        if not 0 <= start < self.demo_cache.num_chunks or not bool(self.demo_cache.chunk_valid_mask[start]):
             raise ValueError("DTW start_index 无效。")
 
         device = self.demo_cache.visual_chunk_embeddings.device
@@ -1050,8 +1034,7 @@ class OnlineDTWMatcher:
             raise ValueError("Query Chunk 尚未积累足够有效帧。")
         if (
             not self.config.rgb_only
-            and query.state_normalization_signature
-            != self.demo_cache.state_normalizer.signature
+            and query.state_normalization_signature != self.demo_cache.state_normalizer.signature
         ):
             raise ValueError("Query 与 Demo 必须使用同一套 State 归一化统计量。")
 
@@ -1084,9 +1067,7 @@ class OnlineDTWMatcher:
         accumulated_cost = self._cost_offset + float(row_minimum)
 
         normalized = torch.where(finite, band_costs - row_minimum, band_costs)
-        confidence = float(
-            torch.softmax(-normalized[finite] / self.config.dtw_temperature, dim=0).max()
-        )
+        confidence = float(torch.softmax(-normalized[finite] / self.config.dtw_temperature, dim=0).max())
         self._previous_start = search_start
         self._previous_costs = normalized
         self._active_index = best_index
@@ -1098,11 +1079,7 @@ class OnlineDTWMatcher:
             demo_chunk_index=best_index,
             demo_observation_index=demo_index,
             demo_timestamp=float(self.demo_cache.timestamps[demo_index]),
-            phase=float(
-                self.demo_cache.timestamps_to_phase(
-                    self.demo_cache.timestamps[demo_index]
-                )
-            ),
+            phase=float(self.demo_cache.timestamps_to_phase(self.demo_cache.timestamps[demo_index])),
             confidence=confidence,
             local_cost=float(local_costs[best_offset]),
             accumulated_cost=accumulated_cost,

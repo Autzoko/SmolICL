@@ -162,13 +162,8 @@ wandb/
 # Dev scripts
 .dev/
 
-# SmolVLA-ICL local contract tests (kept outside version control by design)
-tests/policies/smolvla_icl/
-
-# Data folders
-data/
-!src/lerobot/policies/smolvla_icl/data/
-!src/lerobot/policies/smolvla_icl/data/**
+# Local datasets and outputs
+/data/
 outputs/
 
 # Translations

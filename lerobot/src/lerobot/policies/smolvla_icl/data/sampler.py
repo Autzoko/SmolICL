@@ -8,7 +8,6 @@ from lerobot.datasets.sampler import EpisodeAwareSampler
 
 from .contracts import SmolVLAICLSampleIndex
 
-
 __all__ = ["SmolVLAICLEpisodeAwareSampler"]
 
 

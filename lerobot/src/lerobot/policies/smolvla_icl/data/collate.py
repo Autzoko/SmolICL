@@ -8,25 +8,25 @@ Global 训练路径只组装冻结 S3D feature；Local 训练路径只组装 Mat
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import torch
 from torch import Tensor
-from torch.nn import functional as F
+from torch.nn import functional as F  # noqa: N812
 
 from ..components.demo_alignment import LocalDemoWindow, extract_state_features
 from .state import DemoStateNormalizer
 from .types import (
+    SMOLVLA_ICL_DEMO_REF,
+    SMOLVLA_ICL_GLOBAL_DEMO,
+    SMOLVLA_ICL_LOCAL_DEMO,
     EncodedLocalDemoBatch,
     GlobalDemoBatch,
     GlobalDemoSample,
     LocalDemoBatch,
     RawLocalDemoSample,
-    SMOLVLA_ICL_DEMO_REF,
-    SMOLVLA_ICL_GLOBAL_DEMO,
-    SMOLVLA_ICL_LOCAL_DEMO,
 )
-
 
 __all__ = [
     "build_encoded_local_demo_batch",
@@ -64,17 +64,12 @@ def validate_smolvla_icl_training_batch(
 
     batch_size, local_chunk_size = local_demo.valid_mask.shape
     if expected_local_chunk_size is not None and local_chunk_size != expected_local_chunk_size:
-        raise ValueError(
-            f"Local Chunk 长度应为 {expected_local_chunk_size}，实际为 {local_chunk_size}。"
-        )
+        raise ValueError(f"Local Chunk 长度应为 {expected_local_chunk_size}，实际为 {local_chunk_size}。")
     if local_demo.images.shape[:3] != (batch_size, local_chunk_size, 3):
         raise ValueError("Local images 必须为 (B,T_local,3,H,W) Tensor。")
     if local_demo.state_features.shape[:2] != (batch_size, local_chunk_size):
         raise ValueError("Local state_features 必须与 valid_mask 共享 (B,T_local) 前缀。")
-    if (
-        expected_state_dim is not None
-        and local_demo.state_features.shape[-1] != expected_state_dim * 2
-    ):
+    if expected_state_dim is not None and local_demo.state_features.shape[-1] != expected_state_dim * 2:
         raise ValueError(
             "Local state_features 宽度应为 "
             f"{expected_state_dim * 2}，实际为 {local_demo.state_features.shape[-1]}。"
@@ -173,26 +168,19 @@ def collate_global_demo_samples(
 
 def build_encoded_local_demo_batch(
     window: LocalDemoWindow,
-    demo_visual_tokens: Tensor,
-    demo_visual_embeddings: Tensor,
+    demo_visual_hidden: Tensor,
     *,
     expected_state_dim: int = 32,
 ) -> EncodedLocalDemoBatch:
-    """用 Matcher 窗口索引从独立的 ``E_vision`` cache 构造 rollout 输入。"""
+    """用 Matcher 窗口索引从 rollout 视觉 cache 构造 Local 输入。"""
     source_indices = window.source_indices
     valid_mask = window.valid_mask
     clamped_indices = source_indices.clamp_min(0)
-    visual_tokens = demo_visual_tokens[clamped_indices]
-    visual_embeddings = demo_visual_embeddings[clamped_indices]
-    visual_tokens = torch.where(
-        valid_mask[:, None, None],
-        visual_tokens,
-        torch.zeros_like(visual_tokens),
-    )
-    visual_embeddings = torch.where(
+    visual_hidden = demo_visual_hidden[clamped_indices]
+    visual_hidden = torch.where(
         valid_mask[:, None],
-        visual_embeddings,
-        torch.zeros_like(visual_embeddings),
+        visual_hidden,
+        torch.zeros_like(visual_hidden),
     )
 
     raw_state_dim = window.state_features.shape[-1] // 2
@@ -201,8 +189,7 @@ def build_encoded_local_demo_batch(
     if state_padding < 0:
         raise ValueError("Local Demo State 维度超过 expected_state_dim。")
     return EncodedLocalDemoBatch(
-        visual_tokens=visual_tokens.unsqueeze(0),
-        visual_embeddings=visual_embeddings.unsqueeze(0),
+        visual_hidden=visual_hidden.unsqueeze(0),
         # State 和 Velocity 必须分别补齐后再拼回，不能直接
         # 在末尾补零，否则会破坏 [State(32), Velocity(32)] 的分段语义。
         state_features=torch.cat(
@@ -274,25 +261,21 @@ def collate_raw_local_demo_samples(
             )
         )
 
-        rgb = sample.images.float()
-        if sample.images.dtype == torch.uint8:
-            rgb = rgb / 255.0
-        rgb = torch.where(mask[:, None, None, None], rgb, torch.zeros_like(rgb))
+        # 训练期 Local RGB 的唯一数据契约是 CPU uint8。Policy 只会把当前
+        # 视觉 micro-batch 搬到 GPU，并在编码前就地转为 float/归一化。
+        rgb = sample.images
+        if rgb.device.type != "cpu" or rgb.dtype != torch.uint8:
+            raise TypeError("Raw Local images 必须是留在 CPU 的 uint8 Tensor。")
         images.append(rgb)
 
         anchor_time = sample.timestamps[sample.anchor_position]
         relative_times.append((sample.timestamps - anchor_time).float())
         relative_positions.append(
-            (
-                torch.arange(chunk_length, device=sample.timestamps.device)
-                - sample.anchor_position
-            ).float()
+            (torch.arange(chunk_length, device=sample.timestamps.device) - sample.anchor_position).float()
             / chunk_length
         )
         duration = max(sample.demo_end_timestamp - sample.demo_start_timestamp, 1e-6)
-        phases.append(
-            ((sample.timestamps.float() - sample.demo_start_timestamp) / duration).clamp(0, 1)
-        )
+        phases.append(((sample.timestamps.float() - sample.demo_start_timestamp) / duration).clamp(0, 1))
 
     metadata_device = reference.valid_mask.device
     return LocalDemoBatch(

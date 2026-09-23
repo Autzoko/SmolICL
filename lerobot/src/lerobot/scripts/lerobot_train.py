@@ -349,8 +349,7 @@ def make_dataloaders(
 
         if active_cfg.training_demo_cache_dir is None:
             raise ValueError(
-                "SmolVLA-ICL 训练必须配置 policy.training_demo_cache_dir，"
-                "并提前生成冻结 S3D Demo 特征。"
+                "SmolVLA-ICL 训练必须配置 policy.training_demo_cache_dir，并提前生成冻结 S3D Demo 特征。"
             )
         local_demo_reader = getattr(dataset, "local_demo_reader", None)
         if not callable(local_demo_reader):
@@ -484,21 +483,22 @@ def train(cfg: TrainPipelineConfig):
     torch.backends.cuda.matmul.allow_tf32 = True
 
     # --- data (the main process downloads once; peers read the populated cache) ----------------
+    dataset_factory = make_train_eval_datasets
+    if cfg.trainable_config.type == "smolvla_icl":
+        # SmolVLA-ICL 的 train/val/test 与 Demo/Query 划分全部来自
+        # Manifest，不先经过 LeRobot 通用 eval_split 再二次收缩。
+        from lerobot.policies.smolvla_icl.data.factory import (
+            make_smolvla_icl_train_eval_datasets,
+        )
+
+        dataset_factory = make_smolvla_icl_train_eval_datasets
+
     if is_main_process():
         logging.info("Creating dataset")
-        dataset, eval_dataset = make_train_eval_datasets(cfg)
+        dataset, eval_dataset = dataset_factory(cfg)
     accelerator.wait_for_everyone()
     if not is_main_process():
-        dataset, eval_dataset = make_train_eval_datasets(cfg)
-
-    if cfg.trainable_config.type == "smolvla_icl":
-        from lerobot.policies.smolvla_icl.data.factory import prepare_smolvla_icl_datasets
-
-        dataset, eval_dataset = prepare_smolvla_icl_datasets(
-            cfg,
-            dataset,
-            eval_dataset,
-        )
+        dataset, eval_dataset = dataset_factory(cfg)
 
     # --- policy (weight source decided by the resume rule) -------------------------------------
     # On resume, cfg was parsed FROM the checkpoint's train_config.json, so cfg.checkpoint_format

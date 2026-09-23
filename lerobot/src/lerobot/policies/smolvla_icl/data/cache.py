@@ -36,19 +36,17 @@ from .contracts import DemoSampleRef
 from .preprocessing import build_global_demo_clips
 from .state import DemoStateNormalizer
 from .types import (
-    GlobalDemoClips,
-    GlobalDemoSample,
-    RawLocalDemoSample,
     SMOLVLA_ICL_DEMO_REF,
     SMOLVLA_ICL_GLOBAL_DEMO,
     SMOLVLA_ICL_LOCAL_DEMO,
+    GlobalDemoClips,
+    GlobalDemoSample,
+    RawLocalDemoSample,
 )
-
 
 __all__ = [
     "CachedTrainingDemo",
     "DemoFeatureStore",
-    "DemoSampleRef",
     "SmolVLAICLCollator",
     "cache_training_demo",
     "precompute_training_demo",
@@ -61,17 +59,23 @@ class CachedTrainingDemo:
 
     demo_id: str
     global_demo: GlobalDemoSample
+    cache_identity: str
 
     def __post_init__(self) -> None:
         if not self.demo_id:
             raise ValueError("demo_id 不能为空。")
+        if len(self.cache_identity) != 64 or any(
+            char not in "0123456789abcdef" for char in self.cache_identity.lower()
+        ):
+            raise ValueError("cache_identity 必须是 SHA-256 字符串。")
 
     def to_serializable(self) -> dict[str, Any]:
         """导出仅含基础类型和 CPU Tensor 的版本化 payload。"""
         global_demo = self.global_demo
         return {
-            "version": 2,
+            "version": 3,
             "demo_id": self.demo_id,
+            "cache_identity": self.cache_identity,
             "global": {
                 "video_features": global_demo.video_features.detach().cpu(),
                 "states": global_demo.states.detach().cpu(),
@@ -83,7 +87,7 @@ class CachedTrainingDemo:
     @classmethod
     def from_serializable(cls, payload: dict[str, Any]) -> CachedTrainingDemo:
         """从 :meth:`to_serializable` 的 payload 恢复对象。"""
-        if payload.get("version") != 2:
+        if payload.get("version") != 3:
             raise ValueError("不支持的 SmolVLA-ICL 训练缓存版本。")
         demo_id = str(payload["demo_id"])
         global_payload = payload["global"]
@@ -95,6 +99,7 @@ class CachedTrainingDemo:
                 timestamps=global_payload["timestamps"],
                 valid_mask=global_payload["valid_mask"],
             ),
+            cache_identity=str(payload["cache_identity"]),
         )
 
 
@@ -149,9 +154,7 @@ class DemoFeatureStore:
         payload = torch.load(path, map_location="cpu", weights_only=True)
         demo = CachedTrainingDemo.from_serializable(payload)
         if demo.demo_id != demo_id:
-            raise ValueError(
-                f"Demo cache ID 不一致：请求 {demo_id!r}，文件保存 {demo.demo_id!r}。"
-            )
+            raise ValueError(f"Demo cache ID 不一致：请求 {demo_id!r}，文件保存 {demo.demo_id!r}。")
         self._remember(demo)
         return demo
 
@@ -169,18 +172,20 @@ def cache_training_demo(
     demo_id: str,
     global_demo: GlobalDemoClips,
     global_encoder: GlobalDemoEncoder,
+    *,
+    cache_identity: str,
 ) -> CachedTrainingDemo:
     """运行一次冻结 S3D，不触碰 Matcher 或 Local 视觉路径。"""
     if not global_encoder.config.freeze_video_backbone:
         raise ValueError("S3D 未冻结时不能生成离线 Global feature cache。")
-    backbone_parameter = next(global_encoder.video_backbone.parameters(), None)
-    if backbone_parameter is None:
-        raise ValueError("Global video backbone 没有参数，无法确定编码设备。")
-    device = backbone_parameter.device
-    features = global_encoder.encode_video_clips(
-        global_demo.video.unsqueeze(0).to(device),
-        global_demo.valid_mask.unsqueeze(0).to(device),
-    )[0].detach().cpu()
+    features = (
+        global_encoder.encode_video_clips_batched(
+            global_demo.video.unsqueeze(0),
+            global_demo.valid_mask.unsqueeze(0),
+        )[0]
+        .detach()
+        .cpu()
+    )
     cached_global = GlobalDemoSample(
         video_features=features,
         states=global_demo.states.detach().cpu(),
@@ -190,6 +195,7 @@ def cache_training_demo(
     return CachedTrainingDemo(
         demo_id=demo_id,
         global_demo=cached_global,
+        cache_identity=cache_identity,
     )
 
 
@@ -203,6 +209,7 @@ def precompute_training_demo(
     state_normalizer: DemoStateNormalizer,
     global_encoder: GlobalDemoEncoder,
     valid_mask: torch.Tensor | None = None,
+    cache_identity: str,
 ) -> CachedTrainingDemo:
     """从一次 Demo 解码结果生成冻结 Global S3D 缓存。"""
     global_clips = build_global_demo_clips(
@@ -217,6 +224,7 @@ def precompute_training_demo(
         demo_id,
         global_clips,
         global_encoder,
+        cache_identity=cache_identity,
     )
 
 
@@ -242,9 +250,7 @@ class SmolVLAICLCollator:
         if not valid_samples:
             return None
         if any(SMOLVLA_ICL_DEMO_REF not in sample for sample in valid_samples):
-            raise KeyError(
-                f"磁盘缓存训练样本必须包含 {SMOLVLA_ICL_DEMO_REF!r}。"
-            )
+            raise KeyError(f"磁盘缓存训练样本必须包含 {SMOLVLA_ICL_DEMO_REF!r}。")
 
         refs = [sample[SMOLVLA_ICL_DEMO_REF] for sample in valid_samples]
         if not all(isinstance(ref, DemoSampleRef) for ref in refs):
@@ -263,15 +269,25 @@ class SmolVLAICLCollator:
         # 每个 demo_id 在一个 batch 内只调用一次 load；store 的 worker-local
         # LRU 还会消除相邻 batch 的重复磁盘读取。
         cached_demos = [self._store.load(demo_id) for demo_id in unique_ids]
-        # 只解码 sidecar 指定的 Local 窗口，不读取整条 Demo，也不在
-        # DataLoader worker 中执行任何视觉模型。
-        local_samples = [self.local_demo_reader(ref) for ref in refs]
+        # DTW 常让相邻 Query frame 停留在同一 anchor。按
+        # ``(demo_id, local_anchor)`` 去重可避免一个 batch 内重复解码同一窗口；
+        # query_anchor 只用于追踪 Query，不影响 Local Demo 内容。
+        local_by_anchor: dict[tuple[str, int], RawLocalDemoSample] = {}
+        local_samples: list[RawLocalDemoSample] = []
+        for ref in refs:
+            key = (ref.demo_id, ref.local_anchor)
+            sample = local_by_anchor.get(key)
+            if sample is None:
+                sample = self.local_demo_reader(ref)
+                local_by_anchor[key] = sample
+            local_samples.append(sample)
 
         policy_samples = [
             {
                 key: value
                 for key, value in sample.items()
-                if key not in (
+                if key
+                not in (
                     SMOLVLA_ICL_DEMO_REF,
                     SMOLVLA_ICL_GLOBAL_DEMO,
                     SMOLVLA_ICL_LOCAL_DEMO,

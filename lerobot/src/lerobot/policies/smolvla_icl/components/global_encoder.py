@@ -28,10 +28,9 @@ from typing import Self
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
+from torch.nn import functional as F  # noqa: N812
 
 from ..configuration_smolvla_icl import GlobalEncoderConfig
-
 
 __all__ = [
     "GlobalDemoEncoder",
@@ -42,30 +41,10 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class GlobalEncoderOutput:
-    """Global Encoder 的结构化输出。
-
-    ``global_tokens`` 是交给 Demo Expert 的初始 Global 区域。
-    ``clip_tokens`` 保留 Temporal Aggregator 的片段级输出，便于后续
-    添加对比损失、时序辅助损失和可视化，但 Demo Expert 首版只消费
-    ``global_tokens``。
-    """
+    """交给 Demo Expert 的 Global tokens 与有效 mask。"""
 
     global_tokens: Tensor
     global_mask: Tensor
-    clip_tokens: Tensor
-    clip_mask: Tensor
-    clip_phase: Tensor
-
-    def to(self, device: torch.device | str) -> Self:
-        """返回所有 Tensor 已移到目标设备的新输出对象。"""
-        target = torch.device(device)
-        return type(self)(
-            global_tokens=self.global_tokens.to(target),
-            global_mask=self.global_mask.to(target),
-            clip_tokens=self.clip_tokens.to(target),
-            clip_mask=self.clip_mask.to(target),
-            clip_phase=self.clip_phase.to(target),
-        )
 
 
 def _sinusoidal_phase_embedding(phase: Tensor, dimension: int) -> Tensor:
@@ -79,9 +58,7 @@ def _sinusoidal_phase_embedding(phase: Tensor, dimension: int) -> Tensor:
     half_dim = max(1, dimension // 2)
     denominator = max(1, half_dim - 1)
     frequencies = torch.exp(
-        -math.log(10_000.0)
-        * torch.arange(half_dim, device=phase.device, dtype=torch.float32)
-        / denominator
+        -math.log(10_000.0) * torch.arange(half_dim, device=phase.device, dtype=torch.float32) / denominator
     )
     angles = 2 * math.pi * phase_fp32.unsqueeze(-1) * frequencies
     embedding = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
@@ -109,12 +86,16 @@ def _resample_valid_video_frames(clips: Tensor, valid_mask: Tensor) -> Tensor:
         if len(valid_frames) == num_frames:
             dense_clips.append(clip)
             continue
-        indices = torch.linspace(
-            0,
-            len(valid_frames) - 1,
-            steps=num_frames,
-            device=clips.device,
-        ).round().long()
+        indices = (
+            torch.linspace(
+                0,
+                len(valid_frames) - 1,
+                steps=num_frames,
+                device=clips.device,
+            )
+            .round()
+            .long()
+        )
         dense_clips.append(valid_frames.index_select(0, indices))
     return torch.stack(dense_clips)
 
@@ -194,8 +175,7 @@ class S3DVideoBackbone(nn.Module):
             raise ValueError("frame_valid_mask 必须与 clips 的 (N,T) 维度一致。")
         if clips.shape[1] < self.min_temporal_size:
             raise ValueError(
-                f"S3D 每个 clip 至少需要 {self.min_temporal_size} 帧，"
-                f"实际为 {clips.shape[1]} 帧。"
+                f"S3D 每个 clip 至少需要 {self.min_temporal_size} 帧，实际为 {clips.shape[1]} 帧。"
             )
 
         mask = frame_valid_mask.to(device=clips.device, dtype=torch.bool)
@@ -362,9 +342,7 @@ class GlobalDemoEncoder(nn.Module):
         temporal_layer = nn.TransformerEncoderLayer(
             d_model=self.config.temporal_hidden_size,
             nhead=self.config.temporal_num_heads,
-            dim_feedforward=int(
-                self.config.temporal_hidden_size * self.config.temporal_mlp_ratio
-            ),
+            dim_feedforward=int(self.config.temporal_hidden_size * self.config.temporal_mlp_ratio),
             dropout=self.config.temporal_dropout,
             activation="gelu",
             batch_first=True,
@@ -414,10 +392,7 @@ class GlobalDemoEncoder(nn.Module):
     ) -> None:
         """检查冻结 S3D feature 与仍需训练的 State 输入形状。"""
         if states.ndim != 4 or states.shape[-1] != self.config.state_dim:
-            raise ValueError(
-                "Global states 必须为浮点 "
-                f"(B,K,L,{self.config.state_dim}) Tensor。"
-            )
+            raise ValueError(f"Global states 必须为浮点 (B,K,L,{self.config.state_dim}) Tensor。")
         if not states.is_floating_point():
             raise ValueError("Global states 必须是浮点 Tensor。")
         if timestamps.shape != states.shape[:3] or valid_mask.shape != states.shape[:3]:
@@ -430,8 +405,7 @@ class GlobalDemoEncoder(nn.Module):
             or not video_features.is_floating_point()
         ):
             raise ValueError(
-                "缓存的 Global video_features 必须为浮点 "
-                f"(B,K,{self.video_feature_dim}) Tensor。"
+                f"缓存的 Global video_features 必须为浮点 (B,K,{self.video_feature_dim}) Tensor。"
             )
 
         if torch.any(~valid_mask.flatten(1).any(dim=1)):
@@ -451,9 +425,7 @@ class GlobalDemoEncoder(nn.Module):
         batch_size, num_clips, frames_per_clip = video.shape[:3]
         flat_video = video.reshape(batch_size * num_clips, frames_per_clip, *video.shape[3:])
         flat_mask = valid_mask.reshape(batch_size * num_clips, frames_per_clip)
-        backbone_context = (
-            torch.no_grad() if self.config.freeze_video_backbone else nullcontext()
-        )
+        backbone_context = torch.no_grad() if self.config.freeze_video_backbone else nullcontext()
         with backbone_context:
             features = self.video_backbone(flat_video, flat_mask)
         if features.shape != (batch_size * num_clips, self.video_feature_dim):
@@ -463,6 +435,52 @@ class GlobalDemoEncoder(nn.Module):
                 f"实际为 {tuple(features.shape)}。"
             )
         return features.reshape(batch_size, num_clips, self.video_feature_dim)
+
+    def encode_video_clips_batched(
+        self,
+        video: Tensor,
+        valid_mask: Tensor,
+        *,
+        encode_batch_size: int | None = None,
+    ) -> Tensor:
+        """逐批上传并编码 clip，返回与一次性编码相同的 ``(B,K,D_v)``。
+
+        该接口用于 ``set_demo`` 和冻结 S3D 的离线缓存。输入完整视频可以
+        留在 CPU；循环内只把少量 clip 搬到视频骨干所在设备。这样不会改变
+        Global Encoder 的结果或训练边界，只降低 Demo 注册时的显存峰值。
+        """
+        if video.ndim != 6 or video.shape[3] != 3 or not video.is_floating_point():
+            raise ValueError("Global video 必须是浮点 (B,K,L,3,H,W) Tensor。")
+        if valid_mask.shape != video.shape[:3]:
+            raise ValueError("Global video valid_mask 必须为 (B,K,L)。")
+
+        batch_size, num_clips, frames_per_clip = video.shape[:3]
+        if batch_size < 1 or num_clips < 1 or frames_per_clip < 1:
+            raise ValueError("Global video 的 batch、clip 数和每 clip 帧数都必须大于 0。")
+        chunk_size = self.config.clip_encode_batch_size if encode_batch_size is None else encode_batch_size
+        if chunk_size < 1:
+            raise ValueError("encode_batch_size 必须大于 0。")
+
+        backbone_tensor = next(self.video_backbone.parameters(), None)
+        if backbone_tensor is None:
+            backbone_tensor = next(self.video_backbone.buffers(), None)
+        backbone_device = video.device if backbone_tensor is None else backbone_tensor.device
+
+        flat_video = video.reshape(batch_size * num_clips, frames_per_clip, *video.shape[3:])
+        flat_mask = valid_mask.reshape(batch_size * num_clips, frames_per_clip)
+        feature_batches: list[Tensor] = []
+        for start in range(0, len(flat_video), chunk_size):
+            end = min(start + chunk_size, len(flat_video))
+            features = self.encode_video_clips(
+                flat_video[start:end].unsqueeze(0).to(backbone_device),
+                flat_mask[start:end].unsqueeze(0).to(backbone_device),
+            )
+            feature_batches.append(features.squeeze(0))
+        return torch.cat(feature_batches, dim=0).reshape(
+            batch_size,
+            num_clips,
+            self.video_feature_dim,
+        )
 
     def _compute_clip_phase(self, timestamps: Tensor, valid_mask: Tensor) -> Tensor:
         """计算每个 clip 中心在完整 Demo 内的连续 phase。"""
@@ -503,9 +521,7 @@ class GlobalDemoEncoder(nn.Module):
         valid_fraction = valid_mask.float().mean(dim=-1)
         clip_mask = valid_fraction >= self.config.min_valid_frame_fraction
         if torch.any(clip_mask.sum(dim=1) == 0):
-            raise ValueError(
-                "某条 Demo 没有 clip 达到 min_valid_frame_fraction，无法构建 Global Tokens。"
-            )
+            raise ValueError("某条 Demo 没有 clip 达到 min_valid_frame_fraction，无法构建 Global Tokens。")
 
         fusion_dtype = self.rgb_state_fusion[0].weight.dtype
         fused = self.rgb_state_fusion(
@@ -542,14 +558,8 @@ class GlobalDemoEncoder(nn.Module):
             src_key_padding_mask=~temporal_valid,
         )
         task_output = temporal_output[:, : self.config.num_global_tokens]
-        clip_output = temporal_output[:, self.config.num_global_tokens :]
-        clip_output = clip_output * clip_mask.unsqueeze(-1).to(clip_output.dtype)
-
         global_tokens = self.output_projection(task_output)
         return GlobalEncoderOutput(
             global_tokens=global_tokens,
             global_mask=global_mask,
-            clip_tokens=clip_output,
-            clip_mask=clip_mask,
-            clip_phase=clip_phase,
         )

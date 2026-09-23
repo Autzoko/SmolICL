@@ -7,8 +7,9 @@ Demo Expert 的初始 Local Tokens ``L^(0)``。每个 Demo observation 产生
 
 输入契约：
 
-* spatial visual tokens: ``(B, N_L, P, D_v)``；
-* pooled visual feature: ``(B, N_L, D_v)``，仅作为兼容回退；
+* spatial visual tokens: ``(B, N_L, P, D_v)``，先由
+  :meth:`pool_spatial_tokens` 压缩；
+* visual hidden: ``(B, N_L, D_pool)``；
 * ``[State, dState/dt]``: ``(B, N_L, 2*D_s)``；
 * relative time / relative position / global phase: ``(B, N_L)``；
 * valid mask: ``(B, N_L)``；
@@ -18,14 +19,12 @@ Demo Expert 的初始 Local Tokens ``L^(0)``。每个 Demo observation 产生
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Self
 
 import torch
 from torch import Tensor, nn
 
 from ...common.vla_utils import create_sinusoidal_pos_embedding
 from ..configuration_smolvla_icl import LocalEncoderConfig
-
 
 __all__ = ["LocalDemoEncoder", "LocalEncoderOutput"]
 
@@ -37,21 +36,12 @@ class LocalEncoderOutput:
     local_tokens: Tensor
     local_mask: Tensor
 
-    def to(self, device: torch.device | str) -> Self:
-        """返回 Tensor 已移到目标设备的新输出对象。"""
-        target = torch.device(device)
-        return type(self)(
-            local_tokens=self.local_tokens.to(target),
-            local_mask=self.local_mask.to(target),
-        )
-
 
 class LocalDemoEncoder(nn.Module):
     """Local RGB+State+Time -> Demo Expert Local Tokens。
 
     每帧空间视觉 tokens 由一个可学习 query 执行 attention pooling，
-    再与独立编码的 State 在帧内融合。未提供空间 tokens 时兼容使用
-    原有 pooled visual feature。
+    再与独立编码的 State 在帧内融合。
     连续时间信息沿用 SmolVLA flow timestep 的正弦/余弦编码
     风格，但 relative time、relative position 和 global phase 保持独立语义。
     """
@@ -70,9 +60,7 @@ class LocalDemoEncoder(nn.Module):
         )
         # 单个 query 将每帧 P 个空间 token 压缩成一个视觉表示，
         # 因而不会改变 Local 序列长度和后续 Demo Expert 的 Mask 契约。
-        self.spatial_query = nn.Parameter(
-            torch.empty(self.config.visual_projection_dim)
-        )
+        self.spatial_query = nn.Parameter(torch.empty(self.config.visual_projection_dim))
         self.state_projection = nn.Sequential(
             nn.Linear(
                 self.config.state_dim * 2,
@@ -102,87 +90,31 @@ class LocalDemoEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(self.config.output_dim, self.config.output_dim),
         )
-        self.local_type_embedding = nn.Parameter(
-            torch.empty(1, 1, self.config.output_dim)
-        )
+        self.local_type_embedding = nn.Parameter(torch.empty(1, 1, self.config.output_dim))
         self.output_norm = nn.LayerNorm(self.config.output_dim)
         nn.init.normal_(self.spatial_query, mean=0.0, std=0.02)
         nn.init.normal_(self.local_type_embedding, mean=0.0, std=0.02)
 
-    def _validate_inputs(
-        self,
-        visual_embeddings: Tensor,
-        state_features: Tensor,
-        relative_time_s: Tensor,
-        relative_position: Tensor,
-        phase: Tensor,
-        valid_mask: Tensor,
-        visual_tokens: Tensor | None,
-    ) -> None:
-        """检查核心形状；数值有效性由 Demo cache 和 Processor 保证。"""
-        if visual_embeddings.ndim != 3 or visual_embeddings.shape[-1] != self.config.visual_feature_dim:
-            raise ValueError(
-                "Local visual_embeddings 必须为 "
-                f"(B,N,{self.config.visual_feature_dim})。"
-            )
-        if state_features.shape != (
-            *visual_embeddings.shape[:2],
-            self.config.state_dim * 2,
+    def pool_spatial_tokens(self, visual_tokens: Tensor) -> Tensor:
+        """把每帧 spatial tokens 压缩为一个视觉向量。
+
+        该方法也用于训练期的 checkpoint 单元，使 SigLIP、connector 和
+        learnable spatial pooling 在 backward 时一起重算。这样计算图长期
+        保留的是 ``(..., D_pool)``，而不是 ``(..., P, D_vision)``。
+        """
+        if (
+            visual_tokens.ndim < 3
+            or visual_tokens.shape[-2] == 0
+            or visual_tokens.shape[-1] != self.config.visual_feature_dim
+            or not visual_tokens.is_floating_point()
         ):
             raise ValueError(
-                "Local state_features 必须为 "
-                f"(B,N,{self.config.state_dim * 2})。"
+                f"Local spatial tokens 必须为 (...,P,{self.config.visual_feature_dim}) 的浮点 Tensor。"
             )
-        expected_time_shape = visual_embeddings.shape[:2]
-        for name, value in (
-            ("relative_time_s", relative_time_s),
-            ("relative_position", relative_position),
-            ("phase", phase),
-            ("valid_mask", valid_mask),
-        ):
-            if value.shape != expected_time_shape:
-                raise ValueError(f"Local {name} 必须为 (B,N)。")
-        if not visual_embeddings.is_floating_point() or not state_features.is_floating_point():
-            raise ValueError("Local 视觉和 State 特征必须是浮点 Tensor。")
-
-        if visual_tokens is not None:
-            if (
-                visual_tokens.ndim != 4
-                or visual_tokens.shape[:2] != visual_embeddings.shape[:2]
-                or visual_tokens.shape[-1] != self.config.visual_feature_dim
-                or visual_tokens.shape[-2] == 0
-                or not visual_tokens.is_floating_point()
-            ):
-                raise ValueError(
-                    "Local visual_tokens 必须为 "
-                    f"(B,N,P,{self.config.visual_feature_dim}) 的浮点 Tensor。"
-                )
-
-    def _encode_visual(
-        self,
-        visual_embeddings: Tensor,
-        visual_tokens: Tensor | None,
-        mask: Tensor,
-        *,
-        dtype: torch.dtype,
-    ) -> Tensor:
-        """优先从每帧空间 tokens 学习聚合视觉信息。"""
-        if visual_tokens is None:
-            visual_values = torch.where(
-                mask.unsqueeze(-1),
-                visual_embeddings,
-                torch.zeros_like(visual_embeddings),
-            )
-            return self.visual_projection(visual_values.to(dtype=dtype))
-
-        spatial_values = torch.where(
-            mask[:, :, None, None],
-            visual_tokens,
-            torch.zeros_like(visual_tokens),
-        )
-        spatial_hidden = self.visual_projection(spatial_values.to(dtype=dtype))
+        dtype = self.visual_projection[0].weight.dtype
+        spatial_hidden = self.visual_projection(visual_tokens.to(dtype=dtype))
         attention_logits = torch.einsum(
-            "bnpd,d->bnp",
+            "...pd,d->...p",
             spatial_hidden,
             self.spatial_query.to(dtype=dtype),
         ) * (self.config.visual_projection_dim**-0.5)
@@ -191,11 +123,7 @@ class LocalDemoEncoder(nn.Module):
             attention_weights.unsqueeze(-1) * spatial_hidden,
             dim=-2,
         )
-        return torch.where(
-            mask.unsqueeze(-1),
-            visual_hidden,
-            torch.zeros_like(visual_hidden),
-        )
+        return visual_hidden
 
     def _encode_temporal_coordinates(
         self,
@@ -221,27 +149,39 @@ class LocalDemoEncoder(nn.Module):
 
     def forward(
         self,
-        visual_embeddings: Tensor,
+        visual_hidden: Tensor,
         state_features: Tensor,
         relative_time_s: Tensor,
         relative_position: Tensor,
         phase: Tensor,
         valid_mask: Tensor,
-        *,
-        visual_tokens: Tensor | None = None,
     ) -> LocalEncoderOutput:
-        """逐帧融合 Local Demo 特征并返回 ``L^(0)``。"""
-        self._validate_inputs(
-            visual_embeddings,
-            state_features,
-            relative_time_s,
-            relative_position,
-            phase,
-            valid_mask,
-            visual_tokens,
-        )
+        """融合已经 spatial-pool 的视觉特征与 State/时间信息。"""
+        if valid_mask.ndim != 2:
+            raise ValueError("Local valid_mask 必须为 (B,N)。")
+        expected_shape = (*valid_mask.shape, self.config.visual_projection_dim)
+        if visual_hidden.shape != expected_shape or not visual_hidden.is_floating_point():
+            raise ValueError(
+                f"Local visual_hidden 必须为 (B,N,{self.config.visual_projection_dim}) 的浮点 Tensor。"
+            )
+        if state_features.shape != (*valid_mask.shape, self.config.state_dim * 2):
+            raise ValueError(f"Local state_features 必须为 (B,N,{self.config.state_dim * 2})。")
+        for name, value in (
+            ("relative_time_s", relative_time_s),
+            ("relative_position", relative_position),
+            ("phase", phase),
+        ):
+            if value.shape != valid_mask.shape:
+                raise ValueError(f"Local {name} 必须为 (B,N)。")
+        if not state_features.is_floating_point():
+            raise ValueError("Local State 特征必须是浮点 Tensor。")
 
-        mask = valid_mask.to(device=visual_embeddings.device, dtype=torch.bool)
+        mask = valid_mask.to(device=visual_hidden.device, dtype=torch.bool)
+        visual_hidden = torch.where(
+            mask.unsqueeze(-1),
+            visual_hidden,
+            torch.zeros_like(visual_hidden),
+        )
         state_values = torch.where(
             mask.unsqueeze(-1),
             state_features,
@@ -256,16 +196,8 @@ class LocalDemoEncoder(nn.Module):
         phase_values = torch.where(mask, phase, torch.zeros_like(phase))
 
         model_dtype = self.visual_projection[0].weight.dtype
-        visual_hidden = self._encode_visual(
-            visual_embeddings,
-            visual_tokens,
-            mask,
-            dtype=model_dtype,
-        )
         state_hidden = self.state_projection(state_values.to(dtype=model_dtype))
-        fused_hidden = self.rgb_state_fusion(
-            torch.cat([visual_hidden, state_hidden], dim=-1)
-        )
+        fused_hidden = self.rgb_state_fusion(torch.cat([visual_hidden, state_hidden], dim=-1))
         temporal_hidden = self._encode_temporal_coordinates(
             relative_time_values,
             relative_position_values,
@@ -274,9 +206,7 @@ class LocalDemoEncoder(nn.Module):
         )
 
         local_tokens = self.output_norm(
-            fused_hidden
-            + temporal_hidden
-            + self.local_type_embedding.to(dtype=model_dtype)
+            fused_hidden + temporal_hidden + self.local_type_embedding.to(dtype=model_dtype)
         )
         local_tokens = torch.where(
             mask.unsqueeze(-1),

@@ -315,7 +315,11 @@ class TrainPipelineConfig(HubMixin):
             self.optimizer = active_cfg.get_optimizer_preset()
             self.scheduler = active_cfg.get_scheduler_preset()
 
-        if self.eval_steps > 0 and self.dataset.eval_split == 0.0:
+        if (
+            self.eval_steps > 0
+            and self.dataset.eval_split == 0.0
+            and active_cfg.type != "smolvla_icl"
+        ):
             raise ValueError("eval_steps > 0 requires dataset.eval_split > 0.0 to hold out eval data.")
 
         # Remote runs auto-generate the repo_id in submit_to_hf (the policy may only be

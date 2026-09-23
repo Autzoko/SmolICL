@@ -8,12 +8,12 @@ Sidecar 只保存轻量索引，不包含 RGB、State 或模型特征。每个 e
 from __future__ import annotations
 
 import json
+import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
 
 from .contracts import DemoReferenceResolver, DemoSampleRef
-
 
 __all__ = [
     "EpisodeDemoPairing",
@@ -48,10 +48,18 @@ class PairingSidecar:
     原始 LeRobot Dataset 字段名，便于 Local reader 在 processor 前解码。
     """
 
+    manifest_fingerprint: str
+    matcher_snapshot: str
     image_key: str
     epochs: tuple[dict[int, EpisodeDemoPairing], ...]
 
     def __post_init__(self) -> None:
+        if len(self.manifest_fingerprint) != 64 or any(
+            char not in string.hexdigits for char in self.manifest_fingerprint
+        ):
+            raise ValueError("sidecar manifest_fingerprint 必须是 SHA-256 字符串。")
+        if not self.matcher_snapshot:
+            raise ValueError("sidecar matcher_snapshot 不能为空。")
         if not self.image_key:
             raise ValueError("sidecar image_key 不能为空。")
         if not self.epochs:
@@ -71,13 +79,9 @@ class PairingSidecar:
                     raise TypeError("sidecar epoch 的 value 必须是 EpisodeDemoPairing。")
                 previous = demo_to_episode.setdefault(pairing.demo_id, pairing.demo_episode_index)
                 if previous != pairing.demo_episode_index:
-                    raise ValueError(
-                        f"demo_id={pairing.demo_id!r} 在 sidecar 中对应了多个 episode。"
-                    )
+                    raise ValueError(f"demo_id={pairing.demo_id!r} 在 sidecar 中对应了多个 episode。")
                 if query_episode == pairing.demo_episode_index:
-                    raise ValueError(
-                        f"Query episode={query_episode} 不能使用自身作为 Demo。"
-                    )
+                    raise ValueError(f"Query episode={query_episode} 不能使用自身作为 Demo。")
                 normalized[int(query_episode)] = pairing
             current_query_episodes = set(normalized)
             if query_episodes is None:
@@ -88,9 +92,7 @@ class PairingSidecar:
         assert query_episodes is not None
         overlap = sorted(query_episodes & set(demo_to_episode.values()))
         if overlap:
-            raise ValueError(
-                f"sidecar 的 Query/Demo episode 子集必须不相交，当前重叠：{overlap}。"
-            )
+            raise ValueError(f"sidecar 的 Query/Demo episode 子集必须不相交，当前重叠：{overlap}。")
         object.__setattr__(self, "epochs", tuple(normalized_epochs))
 
     @property
@@ -115,7 +117,9 @@ class PairingSidecar:
     def to_dict(self) -> dict[str, Any]:
         """转换为紧凑且可人工检查的 JSON 结构。"""
         return {
-            "version": 1,
+            "version": 2,
+            "manifest_fingerprint": self.manifest_fingerprint,
+            "matcher_snapshot": self.matcher_snapshot,
             "image_key": self.image_key,
             "epochs": [
                 {
@@ -143,7 +147,7 @@ class PairingSidecar:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> Self:
         """从 JSON payload 构建 sidecar。"""
-        if payload.get("version") != 1:
+        if payload.get("version") != 2:
             raise ValueError("不支持的 SmolVLA-ICL pairing sidecar 版本。")
         raw_epochs = payload.get("epochs")
         if not isinstance(raw_epochs, list):
@@ -164,7 +168,12 @@ class PairingSidecar:
                     local_anchors=tuple(int(value) for value in raw_pairing["local_anchors"]),
                 )
             epochs.append(epoch)
-        return cls(image_key=str(payload["image_key"]), epochs=tuple(epochs))
+        return cls(
+            manifest_fingerprint=str(payload["manifest_fingerprint"]),
+            matcher_snapshot=str(payload["matcher_snapshot"]),
+            image_key=str(payload["image_key"]),
+            epochs=tuple(epochs),
+        )
 
     @classmethod
     def load(cls, path: str | Path) -> Self:
@@ -190,9 +199,7 @@ class PairingSidecarResolver(DemoReferenceResolver):
         for epoch_index, epoch in enumerate(self.sidecar.epochs):
             missing = sorted(required - epoch.keys())
             if missing:
-                raise ValueError(
-                    f"pairing sidecar epoch={epoch_index} 缺少 Query episodes: {missing}。"
-                )
+                raise ValueError(f"pairing sidecar epoch={epoch_index} 缺少 Query episodes: {missing}。")
 
     def resolve(
         self,

@@ -8,8 +8,7 @@ from typing import Any
 import torch
 
 from .contracts import DemoReferenceResolver, DemoSampleRef, SmolVLAICLSampleIndex
-from .types import RawLocalDemoSample, SMOLVLA_ICL_DEMO_REF
-
+from .types import SMOLVLA_ICL_DEMO_REF, RawLocalDemoSample
 
 __all__ = ["SmolVLAICLQueryDataset"]
 
