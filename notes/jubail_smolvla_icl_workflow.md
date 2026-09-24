@@ -36,7 +36,7 @@
 建议将可重建产物集中到：
 
 ```text
-/scratch/ll5582/SmolICL_artifacts/libero/
+/scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/
 ├── manifest.json
 ├── train_stats.json
 ├── pairing_sidecar.json
@@ -49,6 +49,24 @@
 │   └── <sha256(demo_id)>.pt
 └── logs/
 ```
+
+旧的 `/scratch/ll5582/SmolICL_artifacts/libero/` 使用 episode-level split，
+只保留作历史备份，不能用于当前训练。不要在旧目录中局部替换单个 artifact；
+Manifest、train stats、sidecar、Global cache 和 Local RGB cache 必须来自同一条
+fingerprint 链。
+
+JUBAIL 上可直接提交仓库内的完整重建作业：
+
+```bash
+mkdir -p /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/logs
+/opt/slurm/20.11.4-13/bin/sbatch \
+  --output=/scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/logs/%x-%j.out \
+  /scratch/ll5582/SmolICL/lerobot/examples/training/smolvla_icl_rebuild_libero_v2.slurm
+```
+
+该作业使用一张 V100，严格按 Manifest v2 → train-only stats → pairing sidecar v4
+→ Global cache → Local RGB cache 顺序执行。输出目录与旧 v1 artifact 隔离；中断后
+使用相同命令重提即可复用身份一致的 Matcher/Global/Local cache 文件。
 
 不要把 Hugging Face、Torch 或视频临时缓存留在容量较小的 home。作业脚本中可
 把它们显式指向 `/scratch/ll5582/cache/` 下的不同子目录。
@@ -92,7 +110,7 @@ pairing sidecar、Local RGB cache 和 Global cache。
 ```bash
 python -m lerobot.policies.smolvla_icl.data.libero_manifest \
   --dataset-root /scratch/ll5582/LIBERO/lerobot_libero \
-  --output /scratch/ll5582/SmolICL_artifacts/libero/manifest.json \
+  --output /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/manifest.json \
   --repo-id lerobot/libero \
   --revision <DATASET_REVISION> \
   --image-key observation.images.image
@@ -105,9 +123,9 @@ RGB。Validation、test 和被排除的 LIBERO-Long 都不参与统计：
 
 ```bash
 python -m lerobot.policies.smolvla_icl.data.train_stats_builder \
-  --manifest /scratch/ll5582/SmolICL_artifacts/libero/manifest.json \
+  --manifest /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/manifest.json \
   --dataset-root /scratch/ll5582/LIBERO/lerobot_libero \
-  --output /scratch/ll5582/SmolICL_artifacts/libero/train_stats.json
+  --output /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/train_stats.json
 ```
 
 ### 4.3 离线 Pairing/DTW Sidecar
@@ -117,11 +135,11 @@ python -m lerobot.policies.smolvla_icl.data.train_stats_builder \
 
 ```bash
 python -m lerobot.policies.smolvla_icl.data.pairing_builder \
-  --manifest /scratch/ll5582/SmolICL_artifacts/libero/manifest.json \
+  --manifest /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/manifest.json \
   --dataset-root /scratch/ll5582/LIBERO/lerobot_libero \
-  --output /scratch/ll5582/SmolICL_artifacts/libero/pairing_sidecar.json \
-  --matcher-cache-dir /scratch/ll5582/SmolICL_artifacts/libero/matcher_cache \
-  --train-stats /scratch/ll5582/SmolICL_artifacts/libero/train_stats.json \
+  --output /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/pairing_sidecar.json \
+  --matcher-cache-dir /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/matcher_cache \
+  --train-stats /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/train_stats.json \
   --matcher-model lerobot/smolvla_base \
   --matcher-revision <MATCHER_REVISION> \
   --n-action-steps 5 \
@@ -146,10 +164,10 @@ python -m lerobot.policies.smolvla_icl.data.pairing_builder \
 
 ```bash
 python -m lerobot.policies.smolvla_icl.data.local_rgb_cache_builder \
-  --manifest /scratch/ll5582/SmolICL_artifacts/libero/manifest.json \
-  --sidecar /scratch/ll5582/SmolICL_artifacts/libero/pairing_sidecar.json \
+  --manifest /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/manifest.json \
+  --sidecar /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/pairing_sidecar.json \
   --dataset-root /scratch/ll5582/LIBERO/lerobot_libero \
-  --output-dir /scratch/ll5582/SmolICL_artifacts/libero/local_rgb_cache \
+  --output-dir /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/local_rgb_cache \
   --video-backend pyav
 ```
 
@@ -164,11 +182,11 @@ episode index/length、dtype 和 frame shape。它不保存任何模型视觉 to
 
 ```bash
 python -m lerobot.policies.smolvla_icl.data.global_cache_builder \
-  --manifest /scratch/ll5582/SmolICL_artifacts/libero/manifest.json \
-  --sidecar /scratch/ll5582/SmolICL_artifacts/libero/pairing_sidecar.json \
+  --manifest /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/manifest.json \
+  --sidecar /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/pairing_sidecar.json \
   --dataset-root /scratch/ll5582/LIBERO/lerobot_libero \
-  --output-dir /scratch/ll5582/SmolICL_artifacts/libero/global_demo_cache \
-  --train-stats /scratch/ll5582/SmolICL_artifacts/libero/train_stats.json \
+  --output-dir /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/global_demo_cache \
+  --train-stats /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/train_stats.json \
   --global-config /path/to/smolvla_icl_config.json \
   --device cuda
 ```
@@ -184,11 +202,11 @@ clip 配置、train stats fingerprint、TorchVision/S3D 权重或旧文件身份
 训练配置至少要指向同一组产物：
 
 ```text
-policy.data_manifest_path=/scratch/ll5582/SmolICL_artifacts/libero/manifest.json
-policy.training_stats_path=/scratch/ll5582/SmolICL_artifacts/libero/train_stats.json
-policy.pairing_sidecar_path=/scratch/ll5582/SmolICL_artifacts/libero/pairing_sidecar.json
-policy.training_demo_cache_dir=/scratch/ll5582/SmolICL_artifacts/libero/global_demo_cache
-policy.training_local_rgb_cache_dir=/scratch/ll5582/SmolICL_artifacts/libero/local_rgb_cache
+policy.data_manifest_path=/scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/manifest.json
+policy.training_stats_path=/scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/train_stats.json
+policy.pairing_sidecar_path=/scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/pairing_sidecar.json
+policy.training_demo_cache_dir=/scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/global_demo_cache
+policy.training_local_rgb_cache_dir=/scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/local_rgb_cache
 dataset.root=/scratch/ll5582/LIBERO/lerobot_libero
 dataset.repo_id=lerobot/libero
 dataset.revision=<DATASET_REVISION>
@@ -264,13 +282,13 @@ python -m lerobot.scripts.lerobot_eval_smolvla_icl \
   --env.task=libero_goal,libero_object,libero_spatial \
   --env.fps=10 \
   --eval.n_episodes=10 \
-  --manifest_path=/scratch/ll5582/SmolICL_artifacts/libero/manifest.json \
-  --train_stats_path=/scratch/ll5582/SmolICL_artifacts/libero/train_stats.json \
+  --manifest_path=/scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/manifest.json \
+  --train_stats_path=/scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/train_stats.json \
   --dataset_root=/scratch/ll5582/LIBERO/lerobot_libero \
   --matcher_model=lerobot/smolvla_base \
   --matcher_revision=<MATCHER_REVISION> \
   --swap_demo_count=1 \
-  --output_dir=/scratch/ll5582/SmolICL_artifacts/libero/eval/run_001
+  --output_dir=/scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/eval/run_001
 ```
 
 该入口固定 `batch_size=1`、同步 env 和串行 task，因为一个 Policy 只维护一份
@@ -295,7 +313,7 @@ Pairing、Global cache 和训练都应使用 Slurm。下面是单 GPU 预处理�
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=12:00:00
-#SBATCH --output=/scratch/ll5582/SmolICL_artifacts/libero/logs/%x-%j.out
+#SBATCH --output=/scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/logs/%x-%j.out
 
 module purge
 module load miniconda-nobashrc

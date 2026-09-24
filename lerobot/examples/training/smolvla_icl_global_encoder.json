@@ -1,0 +1,23 @@
+{
+  "global_encoder": {
+    "pretrained_backbone": true,
+    "freeze_video_backbone": true,
+    "image_size": [224, 224],
+    "image_mean": [0.43216, 0.394666, 0.37645],
+    "image_std": [0.22803, 0.22145, 0.216989],
+    "clip_length": 16,
+    "clip_stride": 16,
+    "clip_encode_batch_size": 2,
+    "state_dim": 32,
+    "state_feature_dim": 128,
+    "temporal_hidden_size": 512,
+    "temporal_num_layers": 2,
+    "temporal_num_heads": 8,
+    "temporal_mlp_ratio": 4.0,
+    "temporal_dropout": 0.0,
+    "num_global_tokens": 8,
+    "output_dim": 720,
+    "min_valid_frame_fraction": 0.5,
+    "eps": 1e-6
+  }
+}
