@@ -156,6 +156,10 @@ class RawLocalDemoSample:
     states: Tensor
     timestamps: Tensor
     valid_mask: Tensor
+    # 窗口左边界的前一帧只用于计算第一个 Local token 的
+    # 后向差分速度，不会产生额外 token。Episode 起点两者均为 None。
+    previous_state: Tensor | None
+    previous_timestamp: float | None
     anchor_position: int
     demo_start_timestamp: float
     demo_end_timestamp: float

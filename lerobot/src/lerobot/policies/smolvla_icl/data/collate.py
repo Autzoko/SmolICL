@@ -64,7 +64,10 @@ def validate_smolvla_icl_training_batch(
 
     batch_size, local_chunk_size = local_demo.valid_mask.shape
     if expected_local_chunk_size is not None and local_chunk_size != expected_local_chunk_size:
-        raise ValueError(f"Local Chunk 长度应为 {expected_local_chunk_size}，实际为 {local_chunk_size}。")
+        raise ValueError(
+            f"Local Chunk 长度应为 {expected_local_chunk_size}，"
+            f"实际为 {local_chunk_size}。"
+        )
     if local_demo.images.shape[:3] != (batch_size, local_chunk_size, 3):
         raise ValueError("Local images 必须为 (B,T_local,3,H,W) Tensor。")
     if local_demo.state_features.shape[:2] != (batch_size, local_chunk_size):
@@ -239,16 +242,28 @@ def collate_raw_local_demo_samples(
             raise ValueError("Raw Local states 必须为 (T,D_state) Tensor。")
         if sample.timestamps.shape != (chunk_length,) or sample.valid_mask.shape != (chunk_length,):
             raise ValueError("Raw Local timestamp/valid_mask 必须为 (T,) Tensor。")
+        if (sample.previous_state is None) != (sample.previous_timestamp is None):
+            raise ValueError(
+                "Raw Local previous_state/previous_timestamp "
+                "必须同时提供或同时为 None。"
+            )
         if not 0 <= sample.anchor_position < chunk_length:
             raise ValueError("Raw Local anchor_position 必须位于窗口内。")
 
         mask = sample.valid_mask.bool()
         raw_states = sample.states.float()
         normalized = state_normalizer.normalize(raw_states, valid_mask=mask)
+        previous_normalized = (
+            None
+            if sample.previous_state is None
+            else state_normalizer.normalize(sample.previous_state.float().unsqueeze(0))[0]
+        )
         features = extract_state_features(
             normalized,
             sample.timestamps,
             valid_mask=mask,
+            previous_state=previous_normalized,
+            previous_timestamp=sample.previous_timestamp,
         )
         state_padding = expected_state_dim - normalized.shape[-1]
         if state_padding < 0:

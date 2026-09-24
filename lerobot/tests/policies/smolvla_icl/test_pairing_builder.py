@@ -55,13 +55,13 @@ def _alignment_cache() -> DemoEmbeddingCache:
 
 def _manifest() -> LiberoDataManifest:
     assignments = (
-        (0, "train", "demo"),
-        (1, "train", "demo"),
-        (2, "train", "query"),
-        (3, "val", "demo"),
-        (4, "val", "query"),
-        (5, "test", "demo"),
-        (6, "test", "query"),
+        (0, 10, "train", "demo"),
+        (1, 10, "train", "demo"),
+        (2, 10, "train", "query"),
+        (3, 11, "val", "demo"),
+        (4, 11, "val", "query"),
+        (5, 12, "test", "demo"),
+        (6, 12, "test", "query"),
     )
     return LiberoDataManifest(
         repo_id="lerobot/libero",
@@ -73,13 +73,13 @@ def _manifest() -> LiberoDataManifest:
             LiberoManifestEpisode(
                 episode_index=index,
                 suite="libero_goal",
-                task_index=10,
-                task="pick",
+                task_index=task_index,
+                task=f"task {task_index}",
                 length=4,
                 split=split,
                 role=role,
             )
-            for index, split, role in assignments
+            for index, task_index, split, role in assignments
         ),
     )
 
@@ -98,12 +98,20 @@ def test_builder_rotates_train_demo_and_keeps_validation_fixed() -> None:
     sidecar = build_pairing_sidecar(
         manifest,
         matcher_snapshot="lerobot/smolvla_base@revision",
+        stats_fingerprint="b" * 64,
+        alignment_config=_alignment_cache().config,
+        n_action_steps=1,
+        query_window_replans=2,
         episode_cache_loader=caches.__getitem__,
         num_epochs=3,
         seed=7,
     )
 
     assert sidecar.manifest_fingerprint == manifest.fingerprint
+    assert sidecar.control_hz == manifest.fps
+    assert sidecar.n_action_steps == 1
+    assert sidecar.query_window_replans == 2
+    assert sidecar.alignment_config == _alignment_cache().config
     assert sidecar.query_episode_indices == [2, 4]
     assert sidecar.epochs[0][2].demo_episode_index != sidecar.epochs[1][2].demo_episode_index
     assert {epoch[4].demo_episode_index for epoch in sidecar.epochs} == {3}
@@ -119,6 +127,7 @@ def test_matcher_episode_cache_round_trip(tmp_path: Path) -> None:
         matcher_snapshot="lerobot/smolvla_base@revision",
         alignment_config=cache.config,
         state_normalizer=cache.state_normalizer,
+        stats_fingerprint="b" * 64,
         resize_imgs_with_padding=(512, 512),
     )
 

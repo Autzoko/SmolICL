@@ -8,11 +8,13 @@ Sidecar 只保存轻量索引，不包含 RGB、State 或模型特征。每个 e
 from __future__ import annotations
 
 import json
+import math
 import string
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Self
 
+from ..configuration_smolvla_icl import DemoAlignmentConfig
 from .contracts import DemoReferenceResolver, DemoSampleRef
 
 __all__ = [
@@ -51,6 +53,11 @@ class PairingSidecar:
     manifest_fingerprint: str
     matcher_snapshot: str
     image_key: str
+    stats_fingerprint: str
+    alignment_config: DemoAlignmentConfig
+    control_hz: float
+    n_action_steps: int
+    query_window_replans: int
     epochs: tuple[dict[int, EpisodeDemoPairing], ...]
 
     def __post_init__(self) -> None:
@@ -62,6 +69,27 @@ class PairingSidecar:
             raise ValueError("sidecar matcher_snapshot 不能为空。")
         if not self.image_key:
             raise ValueError("sidecar image_key 不能为空。")
+        if len(self.stats_fingerprint) != 64 or any(
+            char not in string.hexdigits for char in self.stats_fingerprint
+        ):
+            raise ValueError("sidecar stats_fingerprint 必须是 SHA-256 字符串。")
+        if not math.isfinite(self.control_hz) or self.control_hz <= 0:
+            raise ValueError("sidecar control_hz 必须是有限正数。")
+        if self.n_action_steps < 1:
+            raise ValueError("sidecar n_action_steps 必须大于 0。")
+        if self.query_window_replans < 2:
+            raise ValueError("sidecar query_window_replans 至少为 2。")
+        expected_alignment = self.alignment_config.bind_action_chunking(
+            control_hz=self.control_hz,
+            n_action_steps=self.n_action_steps,
+            query_window_replans=self.query_window_replans,
+        )
+        if self.alignment_config != expected_alignment:
+            raise ValueError(
+                "sidecar alignment_config 与 control_hz/n_action_steps 不一致："
+                f"期望 alignment_hz={expected_alignment.alignment_hz:g}, "
+                f"window_duration_s={expected_alignment.window_duration_s:g}。"
+            )
         if not self.epochs:
             raise ValueError("sidecar 至少需要一个 epoch。")
 
@@ -92,7 +120,9 @@ class PairingSidecar:
         assert query_episodes is not None
         overlap = sorted(query_episodes & set(demo_to_episode.values()))
         if overlap:
-            raise ValueError(f"sidecar 的 Query/Demo episode 子集必须不相交，当前重叠：{overlap}。")
+            raise ValueError(
+                f"sidecar 的 Query/Demo episode 子集必须不相交，当前重叠：{overlap}。"
+            )
         object.__setattr__(self, "epochs", tuple(normalized_epochs))
 
     @property
@@ -117,10 +147,17 @@ class PairingSidecar:
     def to_dict(self) -> dict[str, Any]:
         """转换为紧凑且可人工检查的 JSON 结构。"""
         return {
-            "version": 2,
+            "version": 4,
             "manifest_fingerprint": self.manifest_fingerprint,
             "matcher_snapshot": self.matcher_snapshot,
             "image_key": self.image_key,
+            "stats_fingerprint": self.stats_fingerprint,
+            "alignment": {
+                "control_hz": self.control_hz,
+                "n_action_steps": self.n_action_steps,
+                "query_window_replans": self.query_window_replans,
+                "config": asdict(self.alignment_config),
+            },
             "epochs": [
                 {
                     str(query_episode): {
@@ -147,8 +184,18 @@ class PairingSidecar:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> Self:
         """从 JSON payload 构建 sidecar。"""
-        if payload.get("version") != 2:
-            raise ValueError("不支持的 SmolVLA-ICL pairing sidecar 版本。")
+        if payload.get("version") != 4:
+            raise ValueError(
+                "不支持的 SmolVLA-ICL pairing sidecar 版本；"
+                "旧 sidecar 未绑定 train-only stats/action chunking，请重新生成。"
+            )
+        raw_alignment = payload.get("alignment")
+        if not isinstance(raw_alignment, dict) or not isinstance(raw_alignment.get("config"), dict):
+            raise TypeError("sidecar alignment 必须包含 control/action chunking 和 config。")
+        alignment_payload = dict(raw_alignment["config"])
+        for key in ("matching_state_excluded_indices", "matching_state_velocity_scale"):
+            if alignment_payload.get(key) is not None:
+                alignment_payload[key] = tuple(alignment_payload[key])
         raw_epochs = payload.get("epochs")
         if not isinstance(raw_epochs, list):
             raise TypeError("sidecar epochs 必须是 list。")
@@ -172,6 +219,11 @@ class PairingSidecar:
             manifest_fingerprint=str(payload["manifest_fingerprint"]),
             matcher_snapshot=str(payload["matcher_snapshot"]),
             image_key=str(payload["image_key"]),
+            stats_fingerprint=str(payload["stats_fingerprint"]),
+            alignment_config=DemoAlignmentConfig(**alignment_payload),
+            control_hz=float(raw_alignment["control_hz"]),
+            n_action_steps=int(raw_alignment["n_action_steps"]),
+            query_window_replans=int(raw_alignment["query_window_replans"]),
             epochs=tuple(epochs),
         )
 

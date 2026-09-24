@@ -24,14 +24,16 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.storage import load_dataset_metadata
 from lerobot.distributed.utils import is_main_process
 from lerobot.transforms import ImageTransforms
-from lerobot.utils.constants import IMAGENET_STATS, OBS_STATE
+from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_STATE
 
 from .dataset import SmolVLAICLQueryDataset
 from .global_cache import preflight_global_demo_cache
 from .libero_manifest import LiberoDataManifest, LiberoManifestEpisode
+from .local_rgb_cache import LocalRGBFrameCacheStore, preflight_local_rgb_cache
 from .reader import LeRobotLocalDemoReader
 from .sidecar import PairingSidecar, PairingSidecarResolver
 from .state import DemoStateNormalizer
+from .train_stats import TrainStatsArtifact
 
 __all__ = ["make_smolvla_icl_train_eval_datasets"]
 
@@ -47,6 +49,7 @@ def _validate_data_contract(
     cfg: Any,
     manifest: LiberoDataManifest,
     sidecar: PairingSidecar,
+    train_stats: TrainStatsArtifact,
     metadata: Any,
 ) -> None:
     """确认配置、Manifest、sidecar 和本地 Dataset 描述同一份数据。"""
@@ -56,7 +59,8 @@ def _validate_data_contract(
         )
     if cfg.dataset.revision is not None and cfg.dataset.revision != manifest.revision:
         raise ValueError(
-            f"Dataset revision={cfg.dataset.revision!r} 与 Manifest revision={manifest.revision!r} 不一致。"
+            f"Dataset revision={cfg.dataset.revision!r} 与 "
+            f"Manifest revision={manifest.revision!r} 不一致。"
         )
     if cfg.dataset.episodes is not None or cfg.dataset.exclude_episodes is not None:
         raise ValueError(
@@ -64,7 +68,10 @@ def _validate_data_contract(
             "不能同时设置 dataset.episodes/exclude_episodes。"
         )
     if cfg.dataset.eval_split != 0.0:
-        raise ValueError("SmolVLA-ICL 的 validation 划分已由 Manifest 固定，dataset.eval_split 必须保持 0。")
+        raise ValueError(
+            "SmolVLA-ICL 的 validation 划分已由 Manifest 固定，"
+            "dataset.eval_split 必须保持 0。"
+        )
     if metadata.repo_id != manifest.repo_id:
         raise ValueError("LeRobot metadata 与 Manifest 的 repo_id 不一致。")
     if not math.isclose(float(metadata.fps), manifest.fps, rel_tol=0.0, abs_tol=1e-9):
@@ -77,6 +84,34 @@ def _validate_data_contract(
         raise ValueError("pairing sidecar 与 data manifest 的 fingerprint 不一致。")
     if sidecar.image_key != manifest.image_key:
         raise ValueError("pairing sidecar 与 data manifest 的 image_key 不一致。")
+    if sidecar.stats_fingerprint != train_stats.fingerprint:
+        raise ValueError("pairing sidecar 与 train-only stats artifact 不一致。")
+
+    policy_cfg = cfg.trainable_config
+    if not math.isclose(sidecar.control_hz, manifest.fps, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError("pairing sidecar 的 control_hz 与 Manifest fps 不一致。")
+    if sidecar.n_action_steps != policy_cfg.n_action_steps:
+        raise ValueError(
+            "pairing sidecar 与 Policy 的 n_action_steps 不一致："
+            f"sidecar={sidecar.n_action_steps}, policy={policy_cfg.n_action_steps}；"
+            "请按最终 action chunking 重新生成 sidecar。"
+        )
+    expected_alignment = policy_cfg.demo_alignment.bind_action_chunking(
+        control_hz=manifest.fps,
+        n_action_steps=policy_cfg.n_action_steps,
+        query_window_replans=sidecar.query_window_replans,
+    )
+    if policy_cfg.demo_alignment != expected_alignment:
+        raise ValueError(
+            "Policy demo_alignment 与 Dataset FPS/action chunking 不一致："
+            f"期望 alignment_hz={expected_alignment.alignment_hz:g}, "
+            f"window_duration_s={expected_alignment.window_duration_s:g}。"
+        )
+    if sidecar.alignment_config != policy_cfg.demo_alignment:
+        raise ValueError(
+            "pairing sidecar 的 alignment config 与 Policy 不一致；"
+            "请使用最终 Policy 配置重新生成 matcher cache 和 sidecar。"
+        )
 
     # revision 是数据身份的主要边界；长度检查则可以及时发现
     # 本地 root 被同路径的其他快照替换。
@@ -191,6 +226,25 @@ def _add_imagenet_stats(dataset: LeRobotDataset) -> None:
             dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
 
+def _install_train_stats(
+    dataset: LeRobotDataset,
+    train_stats: TrainStatsArtifact,
+    *,
+    raw_state_key: str,
+    raw_action_key: str,
+) -> None:
+    """用 train-only artifact 替换 Dataset 从全量 metadata 读取的统计。
+
+    artifact 使用 Policy 标准键；Dataset ``meta.stats`` 保留 processor
+    rename 之前的原始键，以继续复用 LeRobot 标准训练入口。
+    """
+    canonical = train_stats.to_dataset_stats()
+    dataset.meta.stats = {
+        raw_state_key: {name: value.clone() for name, value in canonical[OBS_STATE].items()},
+        raw_action_key: {name: value.clone() for name, value in canonical[ACTION].items()},
+    }
+
+
 def _raw_feature_key(
     canonical_key: str,
     features: dict[str, Any],
@@ -212,12 +266,17 @@ def make_smolvla_icl_train_eval_datasets(
         raise NotImplementedError("SmolVLA-ICL sidecar 只支持 map-style Dataset。")
     if policy_cfg.data_manifest_path is None:
         raise ValueError("SmolVLA-ICL 训练必须配置 policy.data_manifest_path。")
+    if policy_cfg.training_stats_path is None:
+        raise ValueError("SmolVLA-ICL 训练必须配置 policy.training_stats_path。")
     if policy_cfg.pairing_sidecar_path is None:
         raise ValueError("SmolVLA-ICL 训练必须配置 policy.pairing_sidecar_path。")
     if policy_cfg.training_demo_cache_dir is None:
         raise ValueError("SmolVLA-ICL 训练必须配置 policy.training_demo_cache_dir。")
+    if policy_cfg.training_local_rgb_cache_dir is None:
+        raise ValueError("SmolVLA-ICL 训练必须配置 policy.training_local_rgb_cache_dir。")
 
     manifest = LiberoDataManifest.load(policy_cfg.data_manifest_path)
+    train_stats = TrainStatsArtifact.load(policy_cfg.training_stats_path, manifest=manifest)
     sidecar = PairingSidecar.load(policy_cfg.pairing_sidecar_path)
     metadata = load_dataset_metadata(
         manifest.repo_id,
@@ -225,24 +284,30 @@ def make_smolvla_icl_train_eval_datasets(
         revision=manifest.revision,
         repo_type=cfg.dataset.repo_type,
     )
-    _validate_data_contract(cfg, manifest, sidecar, metadata)
+    _validate_data_contract(cfg, manifest, sidecar, train_stats, metadata)
     _validate_pairings(sidecar, manifest, metadata)
 
     # 在创建 Dataset/DataLoader worker 之前检查所有 Global cache。主进程
     # 完整读取 Tensor；其他 rank 经过训练入口的 barrier 后只复核 manifest
     # 和文件存在性，避免并发扫描共享存储。
     state_key = _raw_feature_key(OBS_STATE, metadata.features, cfg.rename_map)
+    action_key = _raw_feature_key(ACTION, metadata.features, cfg.rename_map)
+    train_dataset_stats = train_stats.to_dataset_stats()
+    state_normalizer = DemoStateNormalizer.from_dataset_stats(train_dataset_stats)
     preflight_global_demo_cache(
         policy_cfg.training_demo_cache_dir,
         manifest=manifest,
         sidecar=sidecar,
         config=policy_cfg.global_encoder,
-        state_normalizer=DemoStateNormalizer.from_dataset_stats(
-            metadata.stats,
-            state_key=state_key,
-        ),
+        state_normalizer=state_normalizer,
         state_key=state_key,
+        stats_fingerprint=train_stats.fingerprint,
         validate_tensors=is_main_process(),
+    )
+    local_rgb_manifest = preflight_local_rgb_cache(
+        policy_cfg.training_local_rgb_cache_dir,
+        manifest=manifest,
+        sidecar=sidecar,
     )
 
     delta_timestamps = resolve_delta_timestamps(policy_cfg, metadata, cfg.rename_map)
@@ -270,6 +335,13 @@ def make_smolvla_icl_train_eval_datasets(
         delta_timestamps=None,
         image_transforms=None,
     )
+    for current_dataset in (train_query, val_query, demo_dataset):
+        _install_train_stats(
+            current_dataset,
+            train_stats,
+            raw_state_key=state_key,
+            raw_action_key=action_key,
+        )
     if cfg.dataset.use_imagenet_stats:
         _add_imagenet_stats(train_query)
         _add_imagenet_stats(val_query)
@@ -281,6 +353,10 @@ def make_smolvla_icl_train_eval_datasets(
         state_key=state_key,
         chunk_size=policy_cfg.demo_alignment.local_chunk_size,
         anchor_position=policy_cfg.demo_alignment.local_anchor_position,
+        rgb_cache=LocalRGBFrameCacheStore(
+            policy_cfg.training_local_rgb_cache_dir,
+            local_rgb_manifest,
+        ),
     )
     resolver = PairingSidecarResolver(sidecar)
     resolver.validate_query_episodes(train_query.episodes)

@@ -3,8 +3,10 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from lerobot.policies.smolvla_icl.configuration_smolvla_icl import DemoAlignmentConfig
 from lerobot.policies.smolvla_icl.data.contracts import (
     DemoSampleRef,
     SmolVLAICLSampleIndex,
@@ -62,6 +64,13 @@ def make_resolver(*epochs: dict[int, EpisodeDemoPairing]) -> PairingSidecarResol
             manifest_fingerprint="a" * 64,
             matcher_snapshot="matcher@test",
             image_key="observation.images.top",
+            stats_fingerprint="b" * 64,
+            alignment_config=DemoAlignmentConfig.for_action_chunking(
+                control_hz=10.0, n_action_steps=1
+            ),
+            control_hz=10.0,
+            n_action_steps=1,
+            query_window_replans=4,
             epochs=epochs,
         )
     )
@@ -142,6 +151,13 @@ def test_pairing_sidecar_roundtrip_and_epoch_cycle(tmp_path: Path) -> None:
         manifest_fingerprint="a" * 64,
         matcher_snapshot="lerobot/smolvla_base@test",
         image_key="observation.images.top",
+        stats_fingerprint="b" * 64,
+        alignment_config=DemoAlignmentConfig.for_action_chunking(
+            control_hz=10.0, n_action_steps=1
+        ),
+        control_hz=10.0,
+        n_action_steps=1,
+        query_window_replans=4,
         epochs=(
             {3: EpisodeDemoPairing("demo-A", 8, (1, 2, 3))},
             {3: EpisodeDemoPairing("demo-B", 9, (4, 5, 6))},
@@ -159,3 +175,10 @@ def test_pairing_sidecar_roundtrip_and_epoch_cycle(tmp_path: Path) -> None:
         task="pick",
     )
     assert reference == DemoSampleRef("demo-B", query_anchor=1, local_anchor=5)
+    assert restored.alignment_config == sidecar.alignment_config
+    assert restored.n_action_steps == sidecar.n_action_steps
+
+
+def test_legacy_sidecar_without_train_stats_is_rejected() -> None:
+    with pytest.raises(ValueError, match="train-only stats"):
+        PairingSidecar.from_dict({"version": 2})

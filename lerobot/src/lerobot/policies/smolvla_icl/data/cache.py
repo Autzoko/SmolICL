@@ -270,7 +270,7 @@ class SmolVLAICLCollator:
         # LRU 还会消除相邻 batch 的重复磁盘读取。
         cached_demos = [self._store.load(demo_id) for demo_id in unique_ids]
         # DTW 常让相邻 Query frame 停留在同一 anchor。按
-        # ``(demo_id, local_anchor)`` 去重可避免一个 batch 内重复解码同一窗口；
+        # ``(demo_id, local_anchor)`` 去重可避免一个 batch 内重复切片同一窗口；
         # query_anchor 只用于追踪 Query，不影响 Local Demo 内容。
         local_by_anchor: dict[tuple[str, int], RawLocalDemoSample] = {}
         local_samples: list[RawLocalDemoSample] = []

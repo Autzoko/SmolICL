@@ -7,8 +7,8 @@ Manifest 是原始 LeRobot Dataset 与 SmolVLA-ICL 离线预处理之间的唯�
 构建顺序固定为：
 
 1. 排除未纳入实验的 suite（当前默认排除 LIBERO-Long）；
-2. 在每个 task 内独立划分 train/val/test，避免 task 数量差异造成偏斜；
-3. 在每个 ``(split, task)`` 内再次划分互斥的 Demo/Query episode；
+2. 在每个 suite 内按 task 划分互斥的 train/val/test，形成 unseen-task split；
+3. 在每个 task 内把 episode 划分为互斥的 Demo/Query；
 4. 保存数据 revision、随机种子和内容指纹，供 Matcher cache、DTW sidecar
    与 Global cache 验证自己是否由同一份数据协议生成。
 
@@ -73,9 +73,24 @@ def libero_suite_from_task_index(task_index: int) -> LiberoSuite:
     raise ValueError(f"LIBERO task_index 必须位于 [0, 39]，实际为 {task_index}。")
 
 
+def libero_task_index(suite: str, suite_task_id: int) -> int:
+    """把 LIBERO simulator 的 suite 内 task id 映射到 Dataset task_index。"""
+    offsets = {
+        LIBERO_LONG: 0,
+        LIBERO_GOAL: 10,
+        LIBERO_OBJECT: 20,
+        LIBERO_SPATIAL: 30,
+    }
+    if suite not in offsets:
+        raise ValueError(f"未知 LIBERO suite：{suite!r}。")
+    if not 0 <= suite_task_id < 10:
+        raise ValueError(f"LIBERO suite task id 必须位于 [0, 9]，实际为 {suite_task_id}。")
+    return offsets[suite] + suite_task_id
+
+
 @dataclass(frozen=True, slots=True)
 class LiberoManifestConfig:
-    """只描述数据划分的配置，不混入 Matcher 或模型超参数."""
+    """只描述数据划分；三个 split ratio 作用于每个 suite 的 task 数。"""
 
     train_ratio: float = 0.8
     val_ratio: float = 0.1
@@ -166,7 +181,8 @@ class LiberoDataManifest:
 
         # 同一 task 的 suite 和语言描述必须一致，否则无法保证“同任务配对”。
         task_identity: dict[int, tuple[str, str]] = {}
-        grouped_roles: dict[tuple[int, str], set[str]] = defaultdict(set)
+        task_splits: dict[int, DatasetSplit] = {}
+        grouped_roles: dict[int, set[str]] = defaultdict(set)
         for episode in self.episodes:
             if episode.suite not in self.config.included_suites:
                 raise ValueError(f"Manifest 包含未启用 suite：{episode.suite}。")
@@ -181,15 +197,22 @@ class LiberoDataManifest:
             previous = task_identity.setdefault(episode.task_index, identity)
             if previous != identity:
                 raise ValueError(f"task_index={episode.task_index} 对应了多个任务身份。")
-            grouped_roles[(episode.task_index, episode.split)].add(episode.role)
+            previous_split = task_splits.setdefault(episode.task_index, episode.split)
+            if previous_split != episode.split:
+                raise ValueError(
+                    f"unseen-task Manifest 中 task_index={episode.task_index} "
+                    f"不能同时属于 {previous_split} 和 {episode.split}。"
+                )
+            grouped_roles[episode.task_index].add(episode.role)
 
-        # 所有被选择 task 的三个 split 都必须同时含 Demo 与 Query。这样后续
-        # Pairing Builder 无需兜底跨 split 借用 Demo，也就不会产生数据泄漏。
+        # 每个 task 只属于一个 split，并且其 episode 同时包含 Demo/Query。
+        # Pairing Builder 因此总能在同 split、同 task 内找到 Demo，不需要跨
+        # split 兜底，也不会让 seen task 泄漏到 unseen-task validation/test。
         for task_index in task_identity:
-            for split in _SPLITS:
-                roles = grouped_roles.get((task_index, split), set())
-                if roles != set(_ROLES):
-                    raise ValueError(f"task_index={task_index}, split={split} 必须同时包含 Demo 和 Query。")
+            if grouped_roles[task_index] != set(_ROLES):
+                raise ValueError(f"task_index={task_index} 必须同时包含 Demo 和 Query episode。")
+        if set(task_splits.values()) != set(_SPLITS):
+            raise ValueError("unseen-task Manifest 必须同时包含 train、val 和 test task。")
 
     def episode_indices(
         self,
@@ -203,6 +226,16 @@ class LiberoDataManifest:
             for episode in self.episodes
             if (split is None or episode.split == split) and (role is None or episode.role == role)
         ]
+
+    def task_indices(self, *, split: DatasetSplit | None = None) -> list[int]:
+        """返回指定 split 的唯一 task indices，供训练和在线评测选择 task。"""
+        return sorted(
+            {
+                episode.task_index
+                for episode in self.episodes
+                if split is None or episode.split == split
+            }
+        )
 
     def demo_id(self, episode_index: int) -> str:
         """构造跨 cache 目录仍稳定且不会与其他数据 revision 冲突的 Demo ID."""
@@ -218,7 +251,8 @@ class LiberoDataManifest:
 
     def _payload_without_fingerprint(self) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
+            "split_strategy": "unseen_task",
             "dataset": {
                 "repo_id": self.repo_id,
                 "revision": self.revision,
@@ -259,8 +293,8 @@ class LiberoDataManifest:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> Self:
         """从 JSON payload 恢复并校验 Manifest 指纹."""
-        if payload.get("version") != 1:
-            raise ValueError("不支持的 LIBERO Manifest 版本。")
+        if payload.get("version") != 2 or payload.get("split_strategy") != "unseen_task":
+            raise ValueError("Manifest 必须使用 version=2 的 unseen-task split，请重新生成。")
         dataset = payload["dataset"]
         raw_config = dict(payload["split_config"])
         raw_config["included_suites"] = tuple(raw_config["included_suites"])
@@ -294,20 +328,20 @@ def _derived_seed(seed: int, namespace: str, task_index: int) -> int:
     return int.from_bytes(digest[:8], byteorder="big", signed=False)
 
 
-def _allocate_split_counts(
+def _allocate_task_split_counts(
     total: int,
     config: LiberoManifestConfig,
-    task_index: int,
+    suite: LiberoSuite,
 ) -> dict[DatasetSplit, int]:
-    """按最大余数法分配 episode，并保证每个 split 至少可分出 Demo/Query."""
+    """按最大余数法分配 suite 内 task，并保证每个 split 至少一个 task。"""
     ratios = (config.train_ratio, config.val_ratio, config.test_ratio)
     raw_counts = [total * ratio for ratio in ratios]
     counts = [math.floor(value) for value in raw_counts]
 
-    # val/test 的比例经常完全相同。如果用固定 split 顺序打破小数余数平票，
-    # 30 个 task 累计后会让同一 split 系统性多拿 episode。这里使用由 seed 和
-    # task 派生的稳定分数打破平票：结果可复现，但不会永久偏向 val 或 test。
-    tie_breakers = [_derived_seed(config.seed, f"split-remainder:{split}", task_index) for split in _SPLITS]
+    tie_breakers = [
+        _derived_seed(config.seed, f"task-split-remainder:{suite}:{split}", 0)
+        for split in _SPLITS
+    ]
     for index in sorted(
         range(len(_SPLITS)),
         key=lambda item: (raw_counts[item] - counts[item], tie_breakers[item]),
@@ -315,13 +349,13 @@ def _allocate_split_counts(
     )[: total - sum(counts)]:
         counts[index] += 1
 
-    minimum_per_split = 2
+    minimum_per_split = 1
     for receiver in range(len(counts)):
         while counts[receiver] < minimum_per_split:
             donors = [index for index, count in enumerate(counts) if count > minimum_per_split]
             if not donors:
                 raise ValueError(
-                    f"task 只有 {total} 条 episode，无法让 train/val/test 都同时包含 Demo/Query。"
+                    f"suite={suite} 只有 {total} 个 task，无法构建 unseen-task train/val/test。"
                 )
             donor = max(donors, key=lambda index: (counts[index], -index))
             counts[donor] -= 1
@@ -359,6 +393,22 @@ def build_libero_manifest(
     if missing_tasks:
         raise ValueError(f"LIBERO Dataset 缺少启用 suite 的 task indices：{missing_tasks}。")
 
+    task_splits: dict[int, DatasetSplit] = {}
+    for suite in cfg.included_suites:
+        suite_tasks = sorted(
+            task_index
+            for task_index in grouped
+            if libero_suite_from_task_index(task_index) == suite
+        )
+        split_rng = random.Random(_derived_seed(cfg.seed, f"task-split:{suite}", 0))
+        split_rng.shuffle(suite_tasks)
+        split_counts = _allocate_task_split_counts(len(suite_tasks), cfg, suite)
+        cursor = 0
+        for split in _SPLITS:
+            for task_index in suite_tasks[cursor : cursor + split_counts[split]]:
+                task_splits[task_index] = split
+            cursor += split_counts[split]
+
     output: list[LiberoManifestEpisode] = []
     for task_index in sorted(grouped):
         task_episodes = grouped[task_index]
@@ -366,39 +416,28 @@ def build_libero_manifest(
         if len(task_names) != 1:
             raise ValueError(f"task_index={task_index} 对应了多个 task 文本。")
 
-        # 先在 task 内洗牌再切 train/val/test；这避免按原始 episode 顺序取尾部
-        # 导致录制时间、初始状态或转换顺序与 split 偶然相关。
-        split_rng = random.Random(_derived_seed(cfg.seed, "split", task_index))
+        if len(task_episodes) < 2:
+            raise ValueError(f"task_index={task_index} 至少需要两条 episode 才能划分 Demo/Query。")
+        split = task_splits[task_index]
         shuffled = sorted(task_episodes, key=lambda episode: episode.episode_index)
-        split_rng.shuffle(shuffled)
-        split_counts = _allocate_split_counts(len(shuffled), cfg, task_index)
+        random.Random(_derived_seed(cfg.seed, f"role:{split}", task_index)).shuffle(shuffled)
+        demo_count = math.floor(len(shuffled) * cfg.demo_ratio + 0.5)
+        demo_count = min(max(demo_count, 1), len(shuffled) - 1)
+        demo_indices = {episode.episode_index for episode in shuffled[:demo_count]}
 
-        cursor = 0
-        for split in _SPLITS:
-            split_episodes = shuffled[cursor : cursor + split_counts[split]]
-            cursor += split_counts[split]
-
-            # Role 使用独立随机流；以后即使改变 split 的内部实现，也不会通过
-            # 共享 RNG 状态意外改变同一 split 内的 Demo/Query 选择。
-            role_rng = random.Random(_derived_seed(cfg.seed, f"role:{split}", task_index))
-            role_rng.shuffle(split_episodes)
-            demo_count = math.floor(len(split_episodes) * cfg.demo_ratio + 0.5)
-            demo_count = min(max(demo_count, 1), len(split_episodes) - 1)
-            demo_indices = {episode.episode_index for episode in split_episodes[:demo_count]}
-
-            suite = libero_suite_from_task_index(task_index)
-            output.extend(
-                LiberoManifestEpisode(
-                    episode_index=episode.episode_index,
-                    suite=suite,
-                    task_index=episode.task_index,
-                    task=episode.task,
-                    length=episode.length,
-                    split=split,
-                    role="demo" if episode.episode_index in demo_indices else "query",
-                )
-                for episode in split_episodes
+        suite = libero_suite_from_task_index(task_index)
+        output.extend(
+            LiberoManifestEpisode(
+                episode_index=episode.episode_index,
+                suite=suite,
+                task_index=episode.task_index,
+                task=episode.task,
+                length=episode.length,
+                split=split,
+                role="demo" if episode.episode_index in demo_indices else "query",
             )
+            for episode in shuffled
+        )
 
     return LiberoDataManifest(
         repo_id=repo_id,
@@ -574,10 +613,10 @@ def main() -> None:
     parser.add_argument("--repo-id", default="lerobot/libero")
     parser.add_argument("--revision", required=True)
     parser.add_argument("--image-key", default="observation.images.image")
-    parser.add_argument("--train-ratio", type=float, default=0.8)
-    parser.add_argument("--val-ratio", type=float, default=0.1)
-    parser.add_argument("--test-ratio", type=float, default=0.1)
-    parser.add_argument("--demo-ratio", type=float, default=0.2)
+    parser.add_argument("--train-ratio", type=float, default=0.8, help="每个 suite 的 train task 比例")
+    parser.add_argument("--val-ratio", type=float, default=0.1, help="每个 suite 的 val task 比例")
+    parser.add_argument("--test-ratio", type=float, default=0.1, help="每个 suite 的 test task 比例")
+    parser.add_argument("--demo-ratio", type=float, default=0.2, help="每个 task 内的 Demo episode 比例")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -602,6 +641,10 @@ def main() -> None:
                 "output": str(Path(args.output).expanduser()),
                 "fingerprint": manifest.fingerprint,
                 "episodes": len(manifest.episodes),
+                "task_counts": {
+                    split: len(manifest.task_indices(split=split))
+                    for split in _SPLITS
+                },
                 "counts": _count_by_split_and_role(manifest.episodes),
             },
             ensure_ascii=False,
@@ -623,4 +666,5 @@ __all__ = [
     "build_libero_manifest",
     "build_libero_manifest_from_dataset",
     "libero_suite_from_task_index",
+    "libero_task_index",
 ]

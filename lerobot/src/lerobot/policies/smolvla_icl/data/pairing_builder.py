@@ -44,6 +44,7 @@ from .libero_manifest import LiberoDataManifest, LiberoManifestEpisode
 from .reader import LeRobotMatcherEpisodeReader, MatcherEpisodeData
 from .sidecar import EpisodeDemoPairing, PairingSidecar
 from .state import DemoStateNormalizer
+from .train_stats import TrainStatsArtifact
 
 EpisodeCacheLoader = Callable[[int], DemoEmbeddingCache]
 
@@ -117,6 +118,10 @@ def build_pairing_sidecar(
     manifest: LiberoDataManifest,
     *,
     matcher_snapshot: str,
+    stats_fingerprint: str,
+    alignment_config: DemoAlignmentConfig,
+    n_action_steps: int,
+    query_window_replans: int,
     episode_cache_loader: EpisodeCacheLoader,
     num_epochs: int = 1,
     seed: int = 42,
@@ -172,6 +177,11 @@ def build_pairing_sidecar(
         manifest_fingerprint=manifest.fingerprint,
         matcher_snapshot=matcher_snapshot,
         image_key=manifest.image_key,
+        stats_fingerprint=stats_fingerprint,
+        alignment_config=alignment_config,
+        control_hz=manifest.fps,
+        n_action_steps=n_action_steps,
+        query_window_replans=query_window_replans,
         epochs=tuple(epochs),
     )
 
@@ -187,6 +197,7 @@ class MatcherEpisodeCacheStore:
         matcher_snapshot: str,
         alignment_config: DemoAlignmentConfig,
         state_normalizer: DemoStateNormalizer,
+        stats_fingerprint: str,
         resize_imgs_with_padding: tuple[int, int] | None,
     ) -> None:
         self.root = Path(root).expanduser()
@@ -196,6 +207,7 @@ class MatcherEpisodeCacheStore:
             "matcher_snapshot": matcher_snapshot,
             "image_key": manifest.image_key,
             "alignment_config": asdict(alignment_config),
+            "stats_fingerprint": stats_fingerprint,
             "state_normalization_signature": state_normalizer.signature,
             "resize_imgs_with_padding": resize_imgs_with_padding,
         }
@@ -317,9 +329,12 @@ def build_pairing_sidecar_from_dataset(
     dataset_root: str | Path,
     output_path: str | Path,
     matcher_cache_dir: str | Path,
+    train_stats_path: str | Path,
     matcher_model: str | Path = "lerobot/smolvla_base",
     matcher_revision: str | None = None,
     alignment_config: DemoAlignmentConfig | None = None,
+    n_action_steps: int,
+    query_window_replans: int = 4,
     state_key: str = OBS_STATE,
     num_epochs: int = 1,
     seed: int = 42,
@@ -330,7 +345,16 @@ def build_pairing_sidecar_from_dataset(
 ) -> PairingSidecar:
     """读取 LeRobot Dataset、编码 Matcher cache 并生成 sidecar。"""
     manifest = LiberoDataManifest.load(manifest_path)
-    cfg = alignment_config or DemoAlignmentConfig()
+    train_stats = TrainStatsArtifact.load(train_stats_path, manifest=manifest)
+    if n_action_steps < 1:
+        raise ValueError("n_action_steps 必须大于 0。")
+    if query_window_replans < 2:
+        raise ValueError("query_window_replans 至少为 2。")
+    cfg = (alignment_config or DemoAlignmentConfig()).bind_action_chunking(
+        control_hz=manifest.fps,
+        n_action_steps=n_action_steps,
+        query_window_replans=query_window_replans,
+    )
     matcher_path = Path(matcher_model).expanduser()
     if matcher_revision is None and not matcher_path.exists():
         raise ValueError(
@@ -363,10 +387,11 @@ def build_pairing_sidecar_from_dataset(
         actual_length = int(metadata["dataset_to_index"]) - int(metadata["dataset_from_index"])
         if actual_length != manifest_episodes[episode_index].length:
             raise ValueError(f"Dataset episode={episode_index} 长度与 Manifest 不一致。")
-    if state_key not in dataset.meta.stats:
-        raise KeyError(f"Dataset stats 中缺少 State key: {state_key!r}。")
+    train_dataset_stats = train_stats.to_dataset_stats(state_key=state_key)
+    if state_key not in train_dataset_stats:
+        raise KeyError(f"Train stats 中缺少 State key: {state_key!r}。")
     state_normalizer = DemoStateNormalizer.from_dataset_stats(
-        dataset.meta.stats,
+        train_dataset_stats,
         state_key=state_key,
     )
     reader = LeRobotMatcherEpisodeReader(
@@ -399,6 +424,7 @@ def build_pairing_sidecar_from_dataset(
         matcher_snapshot=matcher_snapshot,
         alignment_config=cfg,
         state_normalizer=state_normalizer,
+        stats_fingerprint=train_stats.fingerprint,
         resize_imgs_with_padding=resize,
     )
 
@@ -424,6 +450,10 @@ def build_pairing_sidecar_from_dataset(
     sidecar = build_pairing_sidecar(
         manifest,
         matcher_snapshot=matcher_snapshot,
+        stats_fingerprint=train_stats.fingerprint,
+        alignment_config=cfg,
+        n_action_steps=n_action_steps,
+        query_window_replans=query_window_replans,
         episode_cache_loader=load_episode_cache,
         num_epochs=num_epochs,
         seed=seed,
@@ -445,9 +475,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--matcher-cache-dir", required=True)
+    parser.add_argument("--train-stats", required=True)
     parser.add_argument("--matcher-model", default="lerobot/smolvla_base")
     parser.add_argument("--matcher-revision")
     parser.add_argument("--alignment-config")
+    parser.add_argument(
+        "--n-action-steps",
+        type=int,
+        required=True,
+        help=(
+            "Policy 每次重规划后实际执行的动作数；"
+            "用于从 Dataset FPS 推导 matcher 频率。"
+        ),
+    )
+    parser.add_argument("--query-window-replans", type=int, default=4)
     parser.add_argument("--state-key", default=OBS_STATE)
     parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
@@ -466,9 +507,12 @@ def main() -> None:
         dataset_root=args.dataset_root,
         output_path=args.output,
         matcher_cache_dir=args.matcher_cache_dir,
+        train_stats_path=args.train_stats,
         matcher_model=args.matcher_model,
         matcher_revision=args.matcher_revision,
         alignment_config=_load_alignment_config(args.alignment_config),
+        n_action_steps=args.n_action_steps,
+        query_window_replans=args.query_window_replans,
         state_key=args.state_key,
         num_epochs=args.num_epochs,
         seed=args.seed,

@@ -6,7 +6,7 @@
 """
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Self
 
 from lerobot.configs import PreTrainedConfig
@@ -230,6 +230,30 @@ class DemoAlignmentConfig:
             **kwargs,
         )
 
+    def bind_action_chunking(
+        self,
+        *,
+        control_hz: float,
+        n_action_steps: int,
+        query_window_replans: int = 4,
+    ) -> Self:
+        """保留 Matcher 超参数，只按 action chunking 重建时间语义。
+
+        Builder 和训练数据工厂共同使用此入口，避免一侧手写
+        ``alignment_hz``、另一侧从 ``n_action_steps`` 推导而产生漂移。
+        """
+        kwargs = {
+            item.name: getattr(self, item.name)
+            for item in fields(self)
+            if item.name not in {"alignment_hz", "window_duration_s"}
+        }
+        return type(self).for_action_chunking(
+            control_hz=control_hz,
+            n_action_steps=n_action_steps,
+            query_window_replans=query_window_replans,
+            **kwargs,
+        )
+
     def __post_init__(self) -> None:
         """只保留会直接影响算法正确性的配置检查。"""
         positive_floats = {
@@ -305,13 +329,18 @@ class SmolVLAICLConfig(SmolVLAConfig):
     local_encoder: LocalEncoderConfig = field(default_factory=LocalEncoderConfig)
     demo_alignment: DemoAlignmentConfig = field(default_factory=DemoAlignmentConfig)
 
+    # V100 使用 FP32 参数存储，并由训练入口通过 FP16 autocast/GradScaler
+    # 执行混合精度计算。这样既使用 Volta Tensor Core，也避免直接更新
+    # FP16 参数带来的数值精度损失。A100/H100 可显式改回 ``bfloat16``。
+    vlm_load_dtype: str = "float32"
+
     # Query RGB 和 Local Demo RGB 共享这一套可训练视觉编码器。
     # Matcher 使用另一份冻结 snapshot，不受该开关影响。
     freeze_vision_encoder: bool = False
 
     # Local Demo 一次最多送入视觉编码器的帧数。Local Chunk 的语义窗口
     # 保持不变，只在 GPU 上按小批次编码，避免 B*T 张图同时展开。
-    local_vision_encode_batch_size: int = 8
+    local_vision_encode_batch_size: int = 2
     # 训练时重算视觉前向以换取更低的激活显存；rollout/no_grad 不启用。
     local_vision_gradient_checkpointing: bool = True
 
@@ -321,12 +350,18 @@ class SmolVLAICLConfig(SmolVLAConfig):
     # episode 级数据协议：唯一确定 train/val/test 以及 Demo/Query 划分。
     # 训练数据工厂不再使用 LeRobot 通用 eval_split 重新划分。
     data_manifest_path: str | None = None
+    # 只由 Manifest train/demo + train/query 计算的 State/Action 统计。
+    # Query、Demo、Matcher 与离线 cache 必须共用同一 fingerprint。
+    training_stats_path: str | None = None
     # 离线 DTW 配对表。它只记录 Query episode/frame 到
     # ``demo_id + local_anchor`` 的映射，不保存任何 RGB 或模型 token。
     pairing_sidecar_path: str | None = None
     # 该 LRU 位于每个 DataLoader worker 内，只缓存最近使用的
     # Global S3D feature，不缓存 Local RGB 或模型视觉 tokens。
     training_demo_cache_memory_entries: int = 1
+    # 训练期 Local Demo 只从离线解码的 CPU uint8 episode frame cache 读取；
+    # 可训练 SigLIP/connector 的 token 仍在 forward 中在线计算。
+    training_local_rgb_cache_dir: str | None = None
 
     # 使用很小的非零 gate：基本保持预训练 SmolVLA 的初始行为，同时让
     # Global/Local Encoder、Demo Expert 和 Cross-Attention 从第一次反传

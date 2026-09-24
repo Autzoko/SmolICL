@@ -179,6 +179,7 @@ def rollout(
     recording_repo_id: str | None = None,
     recording_private: bool = False,
     predicted_latents_callback: Callable[[PreTrainedPolicy], None] | None = None,
+    policy_step_callback: Callable[[PreTrainedPolicy], None] | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -211,6 +212,8 @@ def rollout(
         predicted_latents_callback: Optional callback invoked after every ``select_action`` with the policy
             itself. World-model policies (e.g. LingBot-VA) stash predicted video latents on
             ``policy.last_predicted_latents``; this lets the caller concatenate chunks and decode once.
+        policy_step_callback: Optional read-only hook invoked after every ``select_action``. Specialized
+            evaluators can use it to collect policy diagnostics without duplicating the rollout loop.
     Returns:
         The dictionary described above.
     """
@@ -293,6 +296,8 @@ def rollout(
                 action = policy.select_action(observation)
             if predicted_latents_callback is not None:
                 predicted_latents_callback(policy)
+            if policy_step_callback is not None:
+                policy_step_callback(policy)
             action = postprocessor(action)
 
             action_transition = {ACTION: action}

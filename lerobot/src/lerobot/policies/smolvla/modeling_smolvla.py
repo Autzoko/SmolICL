@@ -546,6 +546,7 @@ class VLAFlowMatching(nn.Module):
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
+            vlm_load_dtype=self.config.vlm_load_dtype,
         )
 
         # 状态投影，32->D_VLM

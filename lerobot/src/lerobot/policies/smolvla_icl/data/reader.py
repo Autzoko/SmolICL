@@ -12,6 +12,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import decode_video_frames
 
 from .contracts import DemoSampleRef
+from .local_rgb_cache import LocalRGBFrameCacheStore
 from .types import RawLocalDemoSample
 
 __all__ = ["LeRobotLocalDemoReader", "LeRobotMatcherEpisodeReader", "MatcherEpisodeData"]
@@ -105,11 +106,11 @@ class LeRobotMatcherEpisodeReader:
 
 @dataclass
 class LeRobotLocalDemoReader:
-    """按 ``demo_id + local_anchor`` 解码一个 Local RGB+State 窗口。
+    """按 ``demo_id + local_anchor`` 读取一个 Local RGB+State 窗口。
 
     该 reader 使用一个独立的 Demo-only :class:`LeRobotDataset`：
-    它没有 Query delta timestamps 和图像增广，因此不会解码整条 Demo，
-    也不会把 Query 训练数据处理错用到 Demo 窗口上。
+    它没有 Query delta timestamps 和图像增广。RGB 来自离线 episode mmap，
+    State/时间来自 Parquet；训练进程不会重复调用视频 decoder。
     """
 
     dataset: LeRobotDataset
@@ -118,6 +119,7 @@ class LeRobotLocalDemoReader:
     state_key: str
     chunk_size: int
     anchor_position: int
+    rgb_cache: LocalRGBFrameCacheStore
     _timestamp_bounds: dict[int, tuple[float, float]] = field(
         default_factory=dict,
         init=False,
@@ -134,6 +136,10 @@ class LeRobotLocalDemoReader:
             raise KeyError(f"Demo Dataset 中不存在 State key: {self.state_key!r}。")
         if self.chunk_size < 1 or not 0 <= self.anchor_position < self.chunk_size:
             raise ValueError("Local Demo chunk_size/anchor_position 配置无效。")
+        for demo_id, episode_index in self.demo_id_to_episode.items():
+            entry = self.rgb_cache.entries.get(demo_id)
+            if entry is None or entry.episode_index != episode_index:
+                raise ValueError(f"Local RGB cache 与 Demo episode 映射不一致：{demo_id}")
 
     def __call__(self, reference: DemoSampleRef) -> RawLocalDemoSample:
         try:
@@ -158,17 +164,41 @@ class LeRobotLocalDemoReader:
         absolute_indices = episode_start + requested_local[valid_mask]
         relative_indices = self._absolute_to_relative(absolute_indices.tolist())
 
-        # Parquet 一次读取连续窗口的 State/时间列；视频帧则在
-        # 下方用同一次 decoder 调用批量解码，避免每帧重新打开 mp4。
-        rows = self.dataset.hf_dataset.select_columns([self.state_key, "timestamp"])[relative_indices]
-        valid_states = _stack_column(rows[self.state_key], name=self.state_key).float()
-        valid_timestamps = (
-            _stack_column(rows["timestamp"], name="timestamp").flatten().to(dtype=torch.float64)
+        # 当窗口左边界不是 episode 起点时，额外读取紧邻的前一帧
+        # State/时间。它只用于首个 token 的后向差分，不读 RGB，也不
+        # 改变 Local chunk 的 48-token 长度。
+        window_start = int(requested_local[0])
+        previous_relative_index: int | None = None
+        if window_start > 0:
+            previous_relative_index = self._absolute_to_relative(
+                [episode_start + window_start - 1]
+            )[0]
+        state_row_indices = (
+            [previous_relative_index, *relative_indices]
+            if previous_relative_index is not None
+            else relative_indices
         )
-        valid_images = self._read_images(
-            episode_index,
-            relative_indices,
-            valid_timestamps,
+
+        # State/时间从 Parquet 投影读取；RGB 从 episode 级 mmap 切片，
+        # 训练 worker 不再打开或解码 MP4。
+        rows = self.dataset.hf_dataset.select_columns([self.state_key, "timestamp"])[state_row_indices]
+        all_states = _stack_column(rows[self.state_key], name=self.state_key).float()
+        all_timestamps = _stack_column(rows["timestamp"], name="timestamp").flatten().to(
+            dtype=torch.float64
+        )
+        if previous_relative_index is None:
+            previous_state = None
+            previous_timestamp = None
+            valid_states = all_states
+            valid_timestamps = all_timestamps
+        else:
+            previous_state = all_states[0]
+            previous_timestamp = float(all_timestamps[0])
+            valid_states = all_states[1:]
+            valid_timestamps = all_timestamps[1:]
+        valid_images = self.rgb_cache.read(
+            reference.demo_id,
+            requested_local[valid_mask].to(dtype=torch.long),
         )
 
         images = valid_images.new_zeros(
@@ -179,11 +209,30 @@ class LeRobotLocalDemoReader:
         images[valid_slots] = valid_images
         states[valid_slots] = valid_states
 
-        # LeRobot episode 以固定 fps 采样。对越界 padding 使用相同
-        # 周期外推 timestamp，保证 State 速度特征所需的严格单调时间轴。
-        anchor_slot = int((requested_local[valid_mask] == reference.local_anchor).nonzero()[0])
-        anchor_time = valid_timestamps[anchor_slot]
-        timestamps = anchor_time + relative_slots.to(torch.float64) / self.dataset.meta.fps
+        # 有效帧保留 Dataset 的真实 timestamp，与 rollout 完整 Demo 路径
+        # 一致；只对 episode 外的 padding 按 fps 向左/右外推。
+        timestamps = valid_timestamps.new_empty(self.chunk_size)
+        timestamps[valid_slots] = valid_timestamps
+        period_s = 1.0 / self.dataset.meta.fps
+        first_valid_slot = int(valid_slots[0])
+        if first_valid_slot > 0:
+            left_steps = torch.arange(
+                first_valid_slot,
+                0,
+                -1,
+                dtype=torch.float64,
+                device=timestamps.device,
+            )
+            timestamps[:first_valid_slot] = valid_timestamps[0] - left_steps * period_s
+        last_valid_slot = int(valid_slots[-1])
+        if last_valid_slot + 1 < self.chunk_size:
+            right_steps = torch.arange(
+                1,
+                self.chunk_size - last_valid_slot,
+                dtype=torch.float64,
+                device=timestamps.device,
+            )
+            timestamps[last_valid_slot + 1 :] = valid_timestamps[-1] + right_steps * period_s
 
         demo_start_timestamp, demo_end_timestamp = self._episode_timestamp_bounds(
             episode_index,
@@ -195,6 +244,8 @@ class LeRobotLocalDemoReader:
             states=states,
             timestamps=timestamps,
             valid_mask=valid_mask,
+            previous_state=previous_state,
+            previous_timestamp=previous_timestamp,
             anchor_position=self.anchor_position,
             demo_start_timestamp=demo_start_timestamp,
             demo_end_timestamp=demo_end_timestamp,
@@ -225,27 +276,3 @@ class LeRobotLocalDemoReader:
             return [mapping[index] for index in absolute_indices]
         except KeyError as error:
             raise KeyError("当前 Demo Dataset 未加载 sidecar 引用的 episode。") from error
-
-    def _read_images(
-        self,
-        episode_index: int,
-        relative_indices: list[int],
-        timestamps: Tensor,
-    ) -> Tensor:
-        if self.image_key not in self.dataset.meta.video_keys:
-            rows = self.dataset.hf_dataset.select_columns(self.image_key)[relative_indices]
-            return _stack_column(rows[self.image_key], name=self.image_key)
-
-        episode = self.dataset.meta.episodes[episode_index]
-        video_start = float(episode[f"videos/{self.image_key}/from_timestamp"])
-        video_path = self.dataset.root / self.dataset.meta.get_video_file_path(
-            episode_index,
-            self.image_key,
-        )
-        return decode_video_frames(
-            video_path,
-            [video_start + float(timestamp) for timestamp in timestamps],
-            self.dataset.tolerance_s,
-            self.dataset._video_backend,
-            return_uint8=True,
-        )

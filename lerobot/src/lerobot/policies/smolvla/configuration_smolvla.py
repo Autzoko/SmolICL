@@ -83,6 +83,10 @@ class SmolVLAConfig(PreTrainedConfig):
 
     vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"  # Select the VLM backbone.
     load_vlm_weights: bool = False  # Set to False in case of training the expert from scratch. True when init from pretrained SmolVLA weights
+    # 加载预训练 VLM 权重时使用的参数 dtype。这里保留可序列化字符串，
+    # 使 checkpoint 能在另一台机器上复建相同的参数存储类型；训练计算精度
+    # 由 ``accelerator.mixed_precision`` 独立管理。
+    vlm_load_dtype: str = "bfloat16"
 
     add_image_special_tokens: bool = False  # Whether to use special image tokens around image features.
 
@@ -110,6 +114,11 @@ class SmolVLAConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.vlm_load_dtype not in {"float32", "float16", "bfloat16"}:
+            raise ValueError(
+                "vlm_load_dtype must be one of 'float32', 'float16', or 'bfloat16', "
+                f"got {self.vlm_load_dtype!r}."
+            )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

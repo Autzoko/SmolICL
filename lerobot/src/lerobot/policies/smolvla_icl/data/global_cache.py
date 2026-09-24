@@ -94,6 +94,7 @@ def _cache_identity_payload(
     config: GlobalEncoderConfig,
     state_normalizer: DemoStateNormalizer,
     state_key: str,
+    stats_fingerprint: str,
 ) -> dict[str, Any]:
     return {
         "dataset": {
@@ -105,6 +106,7 @@ def _cache_identity_payload(
         "feature_config": global_cache_feature_config(config),
         "s3d_snapshot": s3d_snapshot_identity(config),
         "state_normalization": _normalization_payload(state_normalizer),
+        "stats_fingerprint": stats_fingerprint,
     }
 
 
@@ -114,6 +116,7 @@ def global_cache_identity(
     config: GlobalEncoderConfig,
     state_normalizer: DemoStateNormalizer,
     state_key: str,
+    stats_fingerprint: str,
 ) -> str:
     """计算单条 cache 文件携带的稳定特征身份。"""
     return _canonical_sha256(
@@ -122,6 +125,7 @@ def global_cache_identity(
             config=config,
             state_normalizer=state_normalizer,
             state_key=state_key,
+            stats_fingerprint=stats_fingerprint,
         )
     )
 
@@ -157,6 +161,7 @@ class GlobalDemoCacheManifest:
     feature_config: dict[str, Any]
     s3d_snapshot: dict[str, Any]
     state_normalization: dict[str, Any]
+    stats_fingerprint: str
     cache_identity: str
     entries: tuple[GlobalDemoCacheEntry, ...]
 
@@ -164,6 +169,7 @@ class GlobalDemoCacheManifest:
         for name, value in (
             ("manifest_fingerprint", self.manifest_fingerprint),
             ("cache_identity", self.cache_identity),
+            ("stats_fingerprint", self.stats_fingerprint),
         ):
             if len(value) != 64 or any(char not in string.hexdigits for char in value):
                 raise ValueError(f"{name} 必须是 SHA-256 字符串。")
@@ -184,7 +190,7 @@ class GlobalDemoCacheManifest:
 
     def _payload_without_fingerprint(self) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
             "manifest_fingerprint": self.manifest_fingerprint,
             "dataset": {
                 "repo_id": self.repo_id,
@@ -195,6 +201,7 @@ class GlobalDemoCacheManifest:
             "feature_config": self.feature_config,
             "s3d_snapshot": self.s3d_snapshot,
             "state_normalization": self.state_normalization,
+            "stats_fingerprint": self.stats_fingerprint,
             "cache_identity": self.cache_identity,
             "entries": [asdict(entry) for entry in self.entries],
         }
@@ -212,6 +219,7 @@ class GlobalDemoCacheManifest:
         config: GlobalEncoderConfig,
         state_normalizer: DemoStateNormalizer,
         state_key: str,
+        stats_fingerprint: str,
         entries: tuple[GlobalDemoCacheEntry, ...],
     ) -> Self:
         """由当前数据与特征配置构造一份排序后的 cache manifest。"""
@@ -220,6 +228,7 @@ class GlobalDemoCacheManifest:
             config=config,
             state_normalizer=state_normalizer,
             state_key=state_key,
+            stats_fingerprint=stats_fingerprint,
         )
         return cls(
             manifest_fingerprint=manifest.fingerprint,
@@ -230,6 +239,7 @@ class GlobalDemoCacheManifest:
             feature_config=identity_payload["feature_config"],
             s3d_snapshot=identity_payload["s3d_snapshot"],
             state_normalization=identity_payload["state_normalization"],
+            stats_fingerprint=identity_payload["stats_fingerprint"],
             cache_identity=_canonical_sha256(identity_payload),
             entries=tuple(sorted(entries, key=lambda entry: entry.demo_id)),
         )
@@ -252,7 +262,7 @@ class GlobalDemoCacheManifest:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> Self:
-        if payload.get("version") != 1:
+        if payload.get("version") != 2:
             raise ValueError("不支持的 Global Demo cache manifest 版本。")
         dataset = payload["dataset"]
         result = cls(
@@ -264,6 +274,7 @@ class GlobalDemoCacheManifest:
             feature_config=dict(payload["feature_config"]),
             s3d_snapshot=dict(payload["s3d_snapshot"]),
             state_normalization=dict(payload["state_normalization"]),
+            stats_fingerprint=str(payload["stats_fingerprint"]),
             cache_identity=str(payload["cache_identity"]),
             entries=tuple(GlobalDemoCacheEntry(**entry) for entry in payload["entries"]),
         )
@@ -332,6 +343,7 @@ def preflight_global_demo_cache(
     config: GlobalEncoderConfig,
     state_normalizer: DemoStateNormalizer,
     state_key: str,
+    stats_fingerprint: str,
     validate_tensors: bool = True,
 ) -> GlobalDemoCacheManifest:
     """在 DataLoader 启动前校验训练会访问的全部 cache。
@@ -343,12 +355,15 @@ def preflight_global_demo_cache(
     # demo_alignment -> data -> factory -> global_cache -> collate 的环。
     from .cache import DemoFeatureStore
 
+    if sidecar.stats_fingerprint != stats_fingerprint:
+        raise ValueError("pairing sidecar 与 Global cache 使用的 train-only stats 不一致。")
     cache_manifest = GlobalDemoCacheManifest.load(root)
     expected_identity_payload = _cache_identity_payload(
         manifest,
         config=config,
         state_normalizer=state_normalizer,
         state_key=state_key,
+        stats_fingerprint=stats_fingerprint,
     )
     expected_identity = _canonical_sha256(expected_identity_payload)
     expected_fields = {
@@ -360,6 +375,7 @@ def preflight_global_demo_cache(
         "feature_config": expected_identity_payload["feature_config"],
         "s3d_snapshot": expected_identity_payload["s3d_snapshot"],
         "state_normalization": expected_identity_payload["state_normalization"],
+        "stats_fingerprint": stats_fingerprint,
         "cache_identity": expected_identity,
     }
     for field_name, expected in expected_fields.items():

@@ -84,14 +84,24 @@ class SmolVLMWithExpertModel(nn.Module):
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
+        vlm_load_dtype: str = "bfloat16",
     ):
         super().__init__()
         require_package("transformers", extra="smolvla")
+        dtype_by_name = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        try:
+            torch_dtype = dtype_by_name[vlm_load_dtype]
+        except KeyError as error:
+            raise ValueError(f"Unsupported VLM load dtype: {vlm_load_dtype!r}.") from error
         if load_vlm_weights:
             print(f"Loading  {model_id} weights ...")
             self.vlm = AutoModelForImageTextToText.from_pretrained(
                 model_id,
-                torch_dtype="bfloat16",
+                torch_dtype=torch_dtype,
                 low_cpu_mem_usage=True,
             )
             config = self.vlm.config

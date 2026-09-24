@@ -7,7 +7,10 @@ import torch
 from torch import nn
 
 from lerobot.policies.smolvla_icl.components.global_encoder import GlobalDemoEncoder
-from lerobot.policies.smolvla_icl.configuration_smolvla_icl import GlobalEncoderConfig
+from lerobot.policies.smolvla_icl.configuration_smolvla_icl import (
+    DemoAlignmentConfig,
+    GlobalEncoderConfig,
+)
 from lerobot.policies.smolvla_icl.data.cache import (
     DemoFeatureStore,
     SmolVLAICLCollator,
@@ -75,6 +78,8 @@ def make_local_sample(_: DemoSampleRef) -> RawLocalDemoSample:
         states=torch.randn(5, 3),
         timestamps=torch.arange(5, dtype=torch.float64) * 0.1,
         valid_mask=torch.ones(5, dtype=torch.bool),
+        previous_state=None,
+        previous_timestamp=None,
         anchor_position=2,
         demo_start_timestamp=0.0,
         demo_end_timestamp=1.0,
@@ -123,12 +128,12 @@ def test_disk_cache_deduplicates_global_demo_and_keeps_local_rgb_raw(tmp_path: P
 
 def _cache_manifest_inputs() -> tuple[LiberoDataManifest, PairingSidecar]:
     assignments = (
-        (0, "train", "demo"),
-        (1, "train", "query"),
-        (2, "val", "demo"),
-        (3, "val", "query"),
-        (4, "test", "demo"),
-        (5, "test", "query"),
+        (0, 10, "train", "demo"),
+        (1, 10, "train", "query"),
+        (2, 11, "val", "demo"),
+        (3, 11, "val", "query"),
+        (4, 12, "test", "demo"),
+        (5, 12, "test", "query"),
     )
     manifest = LiberoDataManifest(
         repo_id="lerobot/libero",
@@ -140,19 +145,26 @@ def _cache_manifest_inputs() -> tuple[LiberoDataManifest, PairingSidecar]:
             LiberoManifestEpisode(
                 episode_index=index,
                 suite="libero_goal",
-                task_index=10,
-                task="pick",
+                task_index=task_index,
+                task=f"task {task_index}",
                 length=28,
                 split=split,
                 role=role,
             )
-            for index, split, role in assignments
+            for index, task_index, split, role in assignments
         ),
     )
     sidecar = PairingSidecar(
         manifest_fingerprint=manifest.fingerprint,
         matcher_snapshot="matcher@revision",
         image_key=manifest.image_key,
+        stats_fingerprint="b" * 64,
+        alignment_config=DemoAlignmentConfig.for_action_chunking(
+            control_hz=manifest.fps, n_action_steps=1
+        ),
+        control_hz=manifest.fps,
+        n_action_steps=1,
+        query_window_replans=4,
         epochs=(
             {
                 1: EpisodeDemoPairing(
@@ -175,6 +187,7 @@ def test_global_cache_manifest_preflight_validates_all_files(tmp_path: Path) -> 
         config=encoder.config,
         state_normalizer=normalizer,
         state_key="observation.state",
+        stats_fingerprint="b" * 64,
     )
     cached = cache_training_demo(
         manifest.demo_id(0),
@@ -194,6 +207,7 @@ def test_global_cache_manifest_preflight_validates_all_files(tmp_path: Path) -> 
         config=encoder.config,
         state_normalizer=normalizer,
         state_key="observation.state",
+        stats_fingerprint="b" * 64,
         entries=(
             GlobalDemoCacheEntry(
                 demo_id=cached.demo_id,
@@ -213,6 +227,7 @@ def test_global_cache_manifest_preflight_validates_all_files(tmp_path: Path) -> 
         config=encoder.config,
         state_normalizer=normalizer,
         state_key="observation.state",
+        stats_fingerprint="b" * 64,
     )
 
     assert restored.fingerprint == cache_manifest.fingerprint

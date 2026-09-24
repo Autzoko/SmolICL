@@ -80,6 +80,7 @@ class VLAFlowMatchingICL(nn.Module):
             self_attn_every_n_layers=config.self_attn_every_n_layers,
             expert_width_multiplier=config.expert_width_multiplier,
             device=config.device if config.device is not None else "auto",
+            vlm_load_dtype=config.vlm_load_dtype,
             global_cross_gate_init=config.global_cross_gate_init,
             local_cross_gate_init=config.local_cross_gate_init,
         )
@@ -752,6 +753,47 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
         if self._matcher is not None:
             self._matcher.reset()
             self._observation_history = self._matcher.create_observation_history()
+
+    def alignment_diagnostics(self) -> dict[str, int | float | None] | None:
+        """返回当前 rollout 的只读对齐状态，供专用 evaluator 记录轨迹。
+
+        Action queue 中间的控制步不会重新运行 Matcher，因此调用方应按
+        ``replan_index`` 去重。历史窗口尚未填满时 ``matcher_updates`` 为 0，
+        但 ``demo_observation_index`` 仍会报告当前实际使用的初始锚点。
+        """
+        if self._matcher is None or self._demo_cache is None:
+            return None
+
+        result = self._matcher.last_result
+        active_index = self._matcher.active_index
+        anchor_index = int(self._demo_cache.anchor_indices[active_index])
+        anchor_timestamp = self._demo_cache.timestamps[anchor_index]
+        diagnostics: dict[str, int | float | None] = {
+            "replan_index": self._replan_index,
+            "matcher_updates": self._matcher.num_updates,
+            "demo_chunk_index": active_index,
+            "demo_observation_index": anchor_index,
+            "demo_timestamp": float(anchor_timestamp),
+            "phase": float(self._demo_cache.timestamps_to_phase(anchor_timestamp)),
+            "confidence": None,
+            "local_cost": None,
+            "accumulated_cost": None,
+            "observation_id": None,
+            "observation_timestamp": None,
+        }
+        if result is not None:
+            diagnostics.update(
+                demo_chunk_index=result.demo_chunk_index,
+                demo_observation_index=result.demo_observation_index,
+                demo_timestamp=result.demo_timestamp,
+                phase=result.phase,
+                confidence=result.confidence,
+                local_cost=result.local_cost,
+                accumulated_cost=result.accumulated_cost,
+                observation_id=result.observation_id,
+                observation_timestamp=result.observation_timestamp,
+            )
+        return diagnostics
 
     @torch.no_grad()
     def set_demo(
