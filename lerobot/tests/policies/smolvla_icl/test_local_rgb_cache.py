@@ -20,6 +20,7 @@ from lerobot.policies.smolvla_icl.data.local_rgb_cache import (
     local_rgb_cache_identity,
     preflight_local_rgb_cache,
 )
+from lerobot.policies.smolvla_icl.data.local_rgb_cache_builder import _channel_first_image_shape
 from lerobot.policies.smolvla_icl.data.sidecar import EpisodeDemoPairing, PairingSidecar
 
 
@@ -68,6 +69,11 @@ def _manifest_and_sidecar() -> tuple[LiberoDataManifest, PairingSidecar]:
         ),
     )
     return manifest, sidecar
+
+
+def test_image_metadata_shape_is_normalized_to_channel_first() -> None:
+    assert _channel_first_image_shape((3, 256, 256)) == (3, 256, 256)
+    assert _channel_first_image_shape((256, 256, 3)) == (3, 256, 256)
 
 
 def test_local_rgb_cache_preflight_and_mmap_slice(tmp_path: Path) -> None:

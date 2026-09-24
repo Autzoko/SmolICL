@@ -42,6 +42,23 @@ def _save_npy_atomic(path: Path, images: torch.Tensor) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _channel_first_image_shape(dataset_shape: tuple[int, ...]) -> tuple[int, int, int]:
+    """将 Dataset 的单帧 RGB 元数据统一为缓存使用的 ``(3,H,W)``。
+
+    LeRobot 的视频 feature 使用 ``(H,W,C)`` 元数据，但解码器返回
+    ``(T,C,H,W)``；部分 image feature 则直接声明 ``(C,H,W)``。这里只
+    归一化元数据，不转置已经解码的图像，避免额外复制完整 episode。
+    """
+    if len(dataset_shape) != 3:
+        raise ValueError("Local RGB Dataset feature shape 必须是三维单帧图像。")
+    if dataset_shape[0] == 3:
+        return dataset_shape
+    if dataset_shape[-1] == 3:
+        height, width, _ = dataset_shape
+        return 3, height, width
+    raise ValueError("Local RGB Dataset feature shape 必须是 RGB 的 (3,H,W) 或 (H,W,3)。")
+
+
 def build_local_rgb_cache(
     *,
     manifest_path: str | Path,
@@ -79,9 +96,10 @@ def build_local_rgb_cache(
     identity = local_rgb_cache_identity(manifest)
     frames_dir = output / "frames" / identity[:20]
     episode_by_index = {episode.episode_index: episode for episode in manifest.episodes}
-    image_shape = tuple(int(value) for value in dataset.meta.features[manifest.image_key]["shape"])
-    if len(image_shape) != 3 or image_shape[0] != 3:
-        raise ValueError("Local RGB Dataset feature shape 必须是 (3,H,W)。")
+    dataset_image_shape = tuple(
+        int(value) for value in dataset.meta.features[manifest.image_key]["shape"]
+    )
+    image_shape = _channel_first_image_shape(dataset_image_shape)
     entries: list[LocalRGBFrameEntry] = []
 
     for demo_id, episode_index in sorted(sidecar.demo_id_to_episode.items()):
