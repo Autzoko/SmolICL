@@ -108,6 +108,11 @@ class SmolVLMWithExpertModel(nn.Module):
         else:
             config = AutoConfig.from_pretrained(model_id)
             self.vlm = SmolVLMForConditionalGeneration(config=config)
+        # ``from_config`` 可能服从 Hugging Face config 中保存的 torch_dtype
+        # （SmolVLM 默认常为 bfloat16），而不是本次训练显式选择的 dtype。
+        # 统一在两条构造路径后转换，保证 V100 的 FP32 参数 + FP16 AMP
+        # 不会混入 GradScaler 无法 unscale 的 BF16 可训练梯度。
+        self.vlm.to(dtype=torch_dtype)
         self.processor = AutoProcessor.from_pretrained(model_id)
         if num_vlm_layers > 0:
             print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
@@ -125,7 +130,7 @@ class SmolVLMWithExpertModel(nn.Module):
                 f"Number of layers in the VLM {len(self.get_vlm_model().text_model.layers)} are not multiple of num_expert_layers {num_expert_layers}"
             )
             lm_expert_config.num_hidden_layers = num_expert_layers
-        self.lm_expert = AutoModel.from_config(lm_expert_config)
+        self.lm_expert = AutoModel.from_config(lm_expert_config).to(dtype=torch_dtype)
 
         self.num_expert_layers = len(self.lm_expert.layers)
         self.self_attn_every_n_layers = self_attn_every_n_layers
