@@ -25,8 +25,14 @@ QUERY_WINDOW_REPLANS="${QUERY_WINDOW_REPLANS:-4}"
 SEED="${SEED:-42}"
 
 GLOBAL_CONFIG="${GLOBAL_CONFIG:-${REPO_ROOT}/lerobot/examples/training/smolvla_icl_global_encoder.json}"
+ALIGNMENT_CONFIG="${ALIGNMENT_CONFIG:-${REPO_ROOT}/lerobot/examples/training/smolvla_icl_libero_alignment.json}"
 
-for required_path in "${REPO_ROOT}/.git" "${DATASET_ROOT}" "${PYTHON_ENV}/bin/python" "${GLOBAL_CONFIG}"; do
+for required_path in \
+  "${REPO_ROOT}/.git" \
+  "${DATASET_ROOT}" \
+  "${PYTHON_ENV}/bin/python" \
+  "${GLOBAL_CONFIG}" \
+  "${ALIGNMENT_CONFIG}"; do
   if [[ ! -e "${required_path}" ]]; then
     echo "Required path does not exist: ${required_path}" >&2
     exit 1
@@ -67,6 +73,7 @@ python -m lerobot.policies.smolvla_icl.data.pairing_builder \
   --output "${ARTIFACT_ROOT}/pairing_sidecar.json" \
   --matcher-cache-dir "${ARTIFACT_ROOT}/matcher_cache" \
   --train-stats "${ARTIFACT_ROOT}/train_stats.json" \
+  --alignment-config "${ALIGNMENT_CONFIG}" \
   --matcher-model "${MATCHER_MODEL}" \
   --matcher-revision "${MATCHER_REVISION}" \
   --n-action-steps "${N_ACTION_STEPS}" \

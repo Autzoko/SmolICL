@@ -14,7 +14,9 @@ from lerobot.policies.smolvla_icl.data.libero_manifest import (
     LiberoManifestEpisode,
 )
 from lerobot.policies.smolvla_icl.data.pairing_builder import (
+    LIBERO_MATCHING_STATE_EXCLUDED_INDICES,
     MatcherEpisodeCacheStore,
+    _load_alignment_config,
     align_query_to_demo,
     build_pairing_sidecar,
 )
@@ -90,6 +92,12 @@ def test_offline_alignment_returns_dense_monotonic_anchors() -> None:
     assert len(anchors) == 4
     assert list(anchors) == sorted(anchors)
     assert all(0 <= anchor < 4 for anchor in anchors)
+
+
+def test_libero_pairing_default_excludes_both_gripper_state_dimensions() -> None:
+    config = _load_alignment_config(None)
+
+    assert config.matching_state_excluded_indices == LIBERO_MATCHING_STATE_EXCLUDED_INDICES
 
 
 def test_builder_rotates_train_demo_and_keeps_validation_fixed() -> None:

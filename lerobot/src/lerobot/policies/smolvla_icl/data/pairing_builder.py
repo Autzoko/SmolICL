@@ -48,6 +48,11 @@ from .train_stats import TrainStatsArtifact
 
 EpisodeCacheLoader = Callable[[int], DemoEmbeddingCache]
 
+# LIBERO 的 raw observation.state 末尾是两维 robot0_gripper_qpos。
+# Pairing builder 只服务于 LIBERO Manifest，因此即使调用方没有提供配置，
+# 也必须同时排除这两维，避免 DTW 利用夹爪开合这一未来动作事件对齐。
+LIBERO_MATCHING_STATE_EXCLUDED_INDICES = (-2, -1)
+
 
 def _stable_seed(seed: int, namespace: str, episode_index: int) -> int:
     """生成不受 Python hash 随机化影响的 episode 局部种子。"""
@@ -309,7 +314,9 @@ def _encode_episode(
 
 def _load_alignment_config(path: str | Path | None) -> DemoAlignmentConfig:
     if path is None:
-        return DemoAlignmentConfig()
+        return DemoAlignmentConfig(
+            matching_state_excluded_indices=LIBERO_MATCHING_STATE_EXCLUDED_INDICES
+        )
     payload = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise TypeError("alignment config 顶层必须是 JSON object。")
@@ -350,7 +357,12 @@ def build_pairing_sidecar_from_dataset(
         raise ValueError("n_action_steps 必须大于 0。")
     if query_window_replans < 2:
         raise ValueError("query_window_replans 至少为 2。")
-    cfg = (alignment_config or DemoAlignmentConfig()).bind_action_chunking(
+    cfg = (
+        alignment_config
+        or DemoAlignmentConfig(
+            matching_state_excluded_indices=LIBERO_MATCHING_STATE_EXCLUDED_INDICES
+        )
+    ).bind_action_chunking(
         control_hz=manifest.fps,
         n_action_steps=n_action_steps,
         query_window_replans=query_window_replans,
@@ -528,6 +540,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "LIBERO_MATCHING_STATE_EXCLUDED_INDICES",
     "MatcherEpisodeCacheStore",
     "align_query_to_demo",
     "build_pairing_sidecar",

@@ -215,7 +215,14 @@ dataset.eval_split=0
 policy.n_action_steps=5
 policy.demo_alignment.alignment_hz=2
 policy.demo_alignment.window_duration_s=2
+policy.demo_alignment.matching_state_excluded_indices='[-2,-1]'
 ```
+
+LIBERO 的 `observation.state` 最后两维均为 `gripper_qpos`。Pairing 和
+Policy 必须同时排除 `(-2, -1)`；否则 DTW 会利用夹爪开合事件，或在训练
+preflight 中因 Policy/Sidecar 配置不一致而被拒绝。仓库中的
+`smolvla_icl_libero_alignment.json` 是离线重建使用的唯一 LIBERO Matcher
+配置入口，完整重建脚本会显式加载它。
 
 ### 4.6.1 V100 32GB 训练配置
 
