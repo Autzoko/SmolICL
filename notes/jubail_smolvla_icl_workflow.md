@@ -240,6 +240,19 @@ parallelism.dp_shard=1
 ```
 
 单卡将 `accelerator.gradient_accumulation.steps` 设为 8，得到 effective batch 8。
+
+正式训练前先提交仓库内的两步真实数据 smoke：
+
+```bash
+mkdir -p /scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/logs
+sbatch \
+  --output=/scratch/ll5582/SmolICL_artifacts/libero_unseen_v2/logs/smolicl-train-smoke-%j.out \
+  /scratch/ll5582/SmolICL/lerobot/examples/training/smolvla_icl_train_libero_smoke.slurm
+```
+
+该作业使用单块 V100、batch size 1 和 FP16 AMP，运行两次完整的前向、反向与
+优化器更新，不保存 checkpoint。只有日志以 exit code 0 结束并输出
+`training smoke passed`，才进入正式多卡训练。
 同一节点使用多张 V100 时采用 DDP；`torchrun` 会把未显式设置的
 `parallelism.dp_replicate` 自动解析为进程数。为保持 effective batch 8：
 
