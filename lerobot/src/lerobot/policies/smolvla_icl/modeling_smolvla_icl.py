@@ -8,6 +8,7 @@ KV cache 的多步 Euler 去噪。
 from __future__ import annotations
 
 import math
+import re
 from collections import deque
 from typing import Any
 
@@ -758,7 +759,7 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
         return targets
 
     def _validate_peft_config(self, peft_config: Any) -> None:
-        """禁止 PEFT 配置静默冻结随机初始化的 Demo 路径。"""
+        """验证 ICL 必训模块，并维护共享视觉冻结的强契约。"""
         super()._validate_peft_config(peft_config)
         configured = set(peft_config.modules_to_save or [])
         missing = set(self._icl_modules_to_save()) - configured
@@ -767,6 +768,77 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
                 "SmolVLA-ICL 的 PEFT 配置必须通过 modules_to_save 完整训练并保存 "
                 f"ICL 新增模块，当前缺少：{sorted(missing)}。"
             )
+
+        if not self.config.freeze_vision_encoder:
+            return
+
+        # PEFT 的 target_modules 支持正则字符串、名称后缀列表以及
+        # ``all-linear``。不能只搜索配置文本中的 ``vision_model``：例如
+        # ["q_proj"] 同样会命中 SigLIP。这里用当前完整 Policy 的真实模块名
+        # 复现这些匹配规则，确保自定义 CLI 无法绕过视觉冻结选项。
+        visual_prefixes = (
+            "model.vlm_with_expert.vlm.model.vision_model",
+            "model.vlm_with_expert.vlm.model.connector",
+        )
+        visual_modules = {
+            name: module
+            for name, module in self.named_modules()
+            if any(name == prefix or name.startswith(f"{prefix}.") for prefix in visual_prefixes)
+        }
+        target_matches = self._match_peft_target_modules(
+            peft_config.target_modules,
+            visual_modules,
+        )
+        saved_matches = self._match_peft_module_suffixes(
+            peft_config.modules_to_save,
+            visual_modules,
+        )
+        if target_matches or saved_matches:
+            raise ValueError(
+                "freeze_vision_encoder=True 时 PEFT 不得训练 SigLIP 或 connector："
+                f"target_modules 命中={target_matches}，"
+                f"modules_to_save 命中={saved_matches}。"
+            )
+
+    @staticmethod
+    def _match_peft_module_suffixes(
+        configured_modules: Any,
+        candidate_modules: dict[str, nn.Module],
+    ) -> list[str]:
+        """返回被 PEFT 名称/后缀列表命中的候选模块名。"""
+        if not configured_modules:
+            return []
+        suffixes = (
+            (configured_modules,)
+            if isinstance(configured_modules, str)
+            else tuple(configured_modules)
+        )
+        return sorted(
+            name
+            for name in candidate_modules
+            if any(name == suffix or name.endswith(f".{suffix}") for suffix in suffixes)
+        )
+
+    @classmethod
+    def _match_peft_target_modules(
+        cls,
+        target_modules: Any,
+        candidate_modules: dict[str, nn.Module],
+    ) -> list[str]:
+        """按 PEFT 的正则、后缀和 all-linear 语义解析 target_modules。"""
+        if not target_modules:
+            return []
+        if not isinstance(target_modules, str):
+            return cls._match_peft_module_suffixes(target_modules, candidate_modules)
+        if target_modules == "all-linear":
+            return sorted(
+                name for name, module in candidate_modules.items() if isinstance(module, nn.Linear)
+            )
+        try:
+            pattern = re.compile(target_modules)
+        except re.error as error:
+            raise ValueError(f"PEFT target_modules 正则表达式无效：{target_modules!r}。") from error
+        return sorted(name for name in candidate_modules if pattern.fullmatch(name))
 
     def reset(self) -> None:
         """开始新 episode：清空动作队列，并让 Matcher 从 Demo 起点重启。"""

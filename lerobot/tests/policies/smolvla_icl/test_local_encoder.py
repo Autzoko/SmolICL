@@ -173,6 +173,26 @@ class TinyVLM(nn.Module):
         self.model.connector = nn.Linear(4, 4)
 
 
+def make_tiny_policy_for_peft_validation(*, freeze_vision_encoder: bool) -> SmolVLAICLPolicy:
+    """构建具备真实模块路径的轻量 Policy，不加载 SmolVLM 权重。"""
+    policy = SmolVLAICLPolicy.__new__(SmolVLAICLPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(
+        freeze_vision_encoder=freeze_vision_encoder,
+        load_vlm_weights=True,
+        num_vlm_layers=2,
+        pretrained_path="dummy/base",
+    )
+    policy.model = nn.Module()
+    policy.model.vlm_with_expert = nn.Module()
+    policy.model.vlm_with_expert.vlm = nn.Module()
+    policy.model.vlm_with_expert.vlm.model = nn.Module()
+    policy.model.vlm_with_expert.vlm.model.vision_model = nn.Module()
+    policy.model.vlm_with_expert.vlm.model.vision_model.q_proj = nn.Linear(4, 4)
+    policy.model.vlm_with_expert.vlm.model.connector = nn.Linear(4, 4)
+    return policy
+
+
 def test_local_rgb_microbatches_preserve_shared_vision_gradients() -> None:
     """CPU uint8 RGB 应分批编码，且 Action 侧损失仍能更新共享视觉参数。"""
     encoder_config = LocalEncoderConfig(
@@ -300,3 +320,54 @@ def test_freeze_shared_vision_also_freezes_connector_outside_expert_only_mode() 
     model.train()
     assert not model.get_vlm_model().vision_model.training
     assert not model.get_vlm_model().connector.training
+
+
+def test_frozen_vision_rejects_custom_peft_targets() -> None:
+    """自定义 PEFT 后缀、正则和 modules_to_save 都不能绕过冻结契约。"""
+    policy = make_tiny_policy_for_peft_validation(freeze_vision_encoder=True)
+    required_modules = policy._icl_modules_to_save()
+
+    invalid_configs = (
+        SimpleNamespace(target_modules=["q_proj"], modules_to_save=required_modules),
+        SimpleNamespace(target_modules=".*vision_model.*", modules_to_save=required_modules),
+        SimpleNamespace(target_modules=["connector"], modules_to_save=required_modules),
+        SimpleNamespace(target_modules="all-linear", modules_to_save=required_modules),
+        SimpleNamespace(
+            target_modules=["action_in_proj"],
+            modules_to_save=[*required_modules, "connector"],
+        ),
+        SimpleNamespace(
+            target_modules=["action_in_proj"],
+            modules_to_save=[*required_modules, "vision_model"],
+        ),
+    )
+
+    for peft_config in invalid_configs:
+        try:
+            policy._validate_peft_config(peft_config)
+        except ValueError as error:
+            assert "不得训练 SigLIP 或 connector" in str(error)
+        else:
+            raise AssertionError("冻结视觉前端时应拒绝命中 SigLIP/connector 的 PEFT 配置。")
+
+
+def test_frozen_vision_accepts_nonvisual_custom_peft_targets() -> None:
+    """冻结视觉前端时仍允许为 Action/Demo 路径自定义 PEFT targets。"""
+    policy = make_tiny_policy_for_peft_validation(freeze_vision_encoder=True)
+    peft_config = SimpleNamespace(
+        target_modules=["action_in_proj"],
+        modules_to_save=policy._icl_modules_to_save(),
+    )
+
+    policy._validate_peft_config(peft_config)
+
+
+def test_trainable_vision_accepts_custom_visual_peft_targets() -> None:
+    """视觉可训练时允许显式定制 SigLIP LoRA 和完整 connector。"""
+    policy = make_tiny_policy_for_peft_validation(freeze_vision_encoder=False)
+    peft_config = SimpleNamespace(
+        target_modules=["q_proj"],
+        modules_to_save=policy._icl_modules_to_save(),
+    )
+
+    policy._validate_peft_config(peft_config)
