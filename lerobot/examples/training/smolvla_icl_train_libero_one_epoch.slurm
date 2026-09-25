@@ -26,6 +26,10 @@ BATCH_SIZE="${BATCH_SIZE:-2}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 LOCAL_VISION_BATCH_SIZE="${LOCAL_VISION_BATCH_SIZE:-8}"
 FREEZE_VISION_ENCODER="${FREEZE_VISION_ENCODER:-false}"
+# 与 smoke 共用同一 V100 FP16 数值配置；只调整 GradScaler 的动态缩放，
+# 不改变模型 forward、loss、反缩放后的梯度或优化器更新规则。
+FP16_INIT_SCALE="${FP16_INIT_SCALE:-4096}"
+FP16_GROWTH_INTERVAL="${FP16_GROWTH_INTERVAL:-10000}"
 # 当前 v2 manifest 的 train/query 共有 109662 帧。ceil(109662 / (8*2)) = 6854，
 # 最后一个分布式 batch 只含少量 sampler padding；不会开始第二个数据 epoch。
 TRAIN_STEPS="${TRAIN_STEPS:-6854}"
@@ -117,6 +121,8 @@ torchrun --standalone --nproc-per-node="${NUM_GPUS}" -m lerobot.scripts.lerobot_
   --save_freq=0 \
   --wandb.enable=false \
   --accelerator.mixed_precision=fp16 \
+  --accelerator.fp16_grad_scaler.init_scale="${FP16_INIT_SCALE}" \
+  --accelerator.fp16_grad_scaler.growth_interval="${FP16_GROWTH_INTERVAL}" \
   --accelerator.gradient_accumulation.steps=1 \
   --parallelism.dp_replicate="${NUM_GPUS}" \
   --parallelism.dp_shard=1 \

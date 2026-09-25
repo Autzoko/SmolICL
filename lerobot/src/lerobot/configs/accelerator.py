@@ -21,6 +21,7 @@ so the whole tree round-trips through the CLI and ``train_config.json`` and pars
 never imports accelerate.
 """
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
     from accelerate.utils import (
         DistributedDataParallelKwargs,
         FullyShardedDataParallelPlugin,
+        GradScalerKwargs,
         GradientAccumulationPlugin,
     )
 
@@ -156,6 +158,40 @@ class GradientAccumulationConfig:
 
 
 @dataclass
+class FP16GradScalerConfig:
+    """Mirror of the GradScaler fields needed to stabilize FP16 training.
+
+    The defaults match PyTorch/Accelerate exactly. Policies that need a smaller initial
+    scale can override these values without changing the loss, optimizer, or unscaled
+    gradients.
+    """
+
+    init_scale: float = 65536.0
+    growth_interval: int = 2000
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.init_scale) or self.init_scale <= 0:
+            raise ValueError(
+                "fp16_grad_scaler.init_scale must be a finite positive value, "
+                f"got {self.init_scale}."
+            )
+        if self.growth_interval < 1:
+            raise ValueError(
+                "fp16_grad_scaler.growth_interval must be >= 1, "
+                f"got {self.growth_interval}."
+            )
+
+    def build_kwargs_handler(self) -> "GradScalerKwargs":
+        """Build the Accelerate kwargs handler without importing Accelerate at parse time."""
+        from accelerate.utils import GradScalerKwargs
+
+        return GradScalerKwargs(
+            init_scale=self.init_scale,
+            growth_interval=self.growth_interval,
+        )
+
+
+@dataclass
 class CompileConfig:
     """torch.compile knobs — a configured placeholder: wiring lands in a later round.
 
@@ -197,6 +233,7 @@ class AcceleratorConfig:
     """
 
     mixed_precision: str = "no"
+    fp16_grad_scaler: FP16GradScalerConfig = field(default_factory=FP16GradScalerConfig)
     gradient_accumulation: GradientAccumulationConfig = field(default_factory=GradientAccumulationConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
     ddp: DDPConfig = field(default_factory=DDPConfig)
@@ -241,11 +278,16 @@ class AcceleratorConfig:
             "mixed_precision": self.mixed_precision,
             "cpu": cpu,
         }
+        kwargs_handlers = []
+        if self.mixed_precision == "fp16":
+            kwargs_handlers.append(self.fp16_grad_scaler.build_kwargs_handler())
         if parallelism.is_sharded:
             kwargs["fsdp_plugin"] = self.fsdp.build_plugin()
             kwargs["parallelism_config"] = _accelerate_parallelism_config(parallelism)
         elif parallelism.is_replicated_only:
-            kwargs["kwargs_handlers"] = [self.ddp.build_kwargs_handler()]
+            kwargs_handlers.append(self.ddp.build_kwargs_handler())
+        if kwargs_handlers:
+            kwargs["kwargs_handlers"] = kwargs_handlers
         return Accelerator(**kwargs)
 
 

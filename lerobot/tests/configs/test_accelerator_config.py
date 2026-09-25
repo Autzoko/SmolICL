@@ -25,6 +25,7 @@ from lerobot.configs.accelerator import (
     ActivationCheckpointingMode,
     CompileConfig,
     DDPConfig,
+    FP16GradScalerConfig,
     FSDPConfig,
     GradientAccumulationConfig,
 )
@@ -48,6 +49,15 @@ class TestFieldValidation:
         with pytest.raises(ValueError, match="gradient_accumulation.steps"):
             GradientAccumulationConfig(steps=0)
 
+    @pytest.mark.parametrize("init_scale", [0, -1, float("inf"), float("nan")])
+    def test_fp16_initial_scale_positive_and_finite(self, init_scale):
+        with pytest.raises(ValueError, match="fp16_grad_scaler.init_scale"):
+            FP16GradScalerConfig(init_scale=init_scale)
+
+    def test_fp16_growth_interval_positive(self):
+        with pytest.raises(ValueError, match="fp16_grad_scaler.growth_interval"):
+            FP16GradScalerConfig(growth_interval=0)
+
 
 class TestDraccusRoundTrip:
     @pytest.mark.parametrize(
@@ -66,6 +76,10 @@ class TestDraccusRoundTrip:
                 ddp=DDPConfig(find_unused_parameters=False, static_graph=True),
                 compile=CompileConfig(enabled=True, mode="max-autotune", regional=False),
                 activation_checkpointing=ActivationCheckpointingConfig(mode=ActivationCheckpointingMode.FULL),
+            ),
+            AcceleratorConfig(
+                mixed_precision="fp16",
+                fp16_grad_scaler=FP16GradScalerConfig(init_scale=4096, growth_interval=10000),
             ),
             AcceleratorConfig(fsdp=FSDPConfig(min_num_params=1_000_000)),
         ],
@@ -133,3 +147,24 @@ class TestRuntimeBuilders:
         assert ga_plugin.num_steps == 4
         assert ga_plugin.sync_with_dataloader is False
         assert "gradient_accumulation_steps" not in captured
+
+    def test_fp16_scaler_and_ddp_handlers_are_both_forwarded(self, monkeypatch):
+        captured = {}
+
+        class FakeAccelerator:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("accelerate.Accelerator", FakeAccelerator)
+        parallelism = ParallelismConfig()
+        parallelism.resolve(2)
+        AcceleratorConfig(
+            mixed_precision="fp16",
+            fp16_grad_scaler=FP16GradScalerConfig(init_scale=4096, growth_interval=10000),
+        ).build(parallelism)
+
+        handlers = captured["kwargs_handlers"]
+        scaler_handler = next(handler for handler in handlers if type(handler).__name__ == "GradScalerKwargs")
+        assert scaler_handler.init_scale == 4096
+        assert scaler_handler.growth_interval == 10000
+        assert any(type(handler).__name__ == "DistributedDataParallelKwargs" for handler in handlers)

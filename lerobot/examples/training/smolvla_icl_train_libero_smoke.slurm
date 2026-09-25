@@ -29,6 +29,11 @@ LOCAL_VISION_BATCH_SIZE="${LOCAL_VISION_BATCH_SIZE:-2}"
 # false：训练 Query/Local 共享 SigLIP；true：冻结视觉路径并自动跳过
 # Local vision checkpoint。Matcher snapshot 始终冻结，不受此变量影响。
 FREEZE_VISION_ENCODER="${FREEZE_VISION_ENCODER:-false}"
+# V100 的 FP16 动态范围较窄。较低初始 scale 避免启动期反向溢出；延长
+# growth interval 防止单个 epoch 内过早升回已知不稳定的 scale。反缩放后的
+# 真实梯度、gradient clipping、optimizer 和 LR schedule 均保持不变。
+FP16_INIT_SCALE="${FP16_INIT_SCALE:-4096}"
+FP16_GROWTH_INTERVAL="${FP16_GROWTH_INTERVAL:-10000}"
 
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
   echo "This smoke test must be submitted with sbatch." >&2
@@ -118,6 +123,8 @@ fi
   --save_checkpoint=false \
   --wandb.enable=false \
   --accelerator.mixed_precision=fp16 \
+  --accelerator.fp16_grad_scaler.init_scale="${FP16_INIT_SCALE}" \
+  --accelerator.fp16_grad_scaler.growth_interval="${FP16_GROWTH_INTERVAL}" \
   --accelerator.gradient_accumulation.steps=1 \
   --parallelism.dp_replicate="${NUM_GPUS}" \
   --parallelism.dp_shard=1 \
