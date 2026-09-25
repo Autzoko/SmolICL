@@ -346,24 +346,26 @@ class SmolVLMWithDemoExpertModel(SmolVLMWithExpertModel):
             self.action_from_local[str(layer_idx)] = adapter
 
     def set_requires_grad(self) -> None:
-        """保留 expert-only 训练，但允许 Query/Local 共享的视觉路径更新。
+        """统一控制 Query/Local 共享的 SigLIP 与 connector 是否训练。
 
-        官方 SmolVLA 的 ``train_expert_only=True`` 会冻结整个 VLM。ICL 在
-        ``freeze_vision_encoder=False`` 时只重新开启 vision model 和 connector，
-        text model 仍按官方 expert-only 语义冻结。
+        官方 SmolVLA 在 ``train_expert_only=False`` 时只会依据
+        ``freeze_vision_encoder`` 冻结 SigLIP，而 connector 仍保持可训练。
+        ICL 把二者视为同一视觉前端，因此必须在官方逻辑执行后显式统一
+        ``requires_grad``，避免 Query 更新 connector、Local 却在 no_grad 下
+        使用 connector 的不对称行为。Text model 仍遵循官方训练配置。
         """
         super().set_requires_grad()
-        if not self.freeze_vision_encoder:
-            for module in (self.get_vlm_model().vision_model, self.get_vlm_model().connector):
-                for parameter in module.parameters():
-                    parameter.requires_grad_(True)
+        train_shared_vision = not self.freeze_vision_encoder
+        for module in (self.get_vlm_model().vision_model, self.get_vlm_model().connector):
+            for parameter in module.parameters():
+                parameter.requires_grad_(train_shared_vision)
 
     def train(self, mode: bool = True):
-        """让可训练视觉路径保持 train mode，其余冻结 VLM 保持 eval。"""
+        """让共享视觉前端的运行模式与冻结配置保持一致。"""
         super().train(mode)
-        if mode and not self.freeze_vision_encoder:
-            self.get_vlm_model().vision_model.train()
-            self.get_vlm_model().connector.train()
+        train_shared_vision = mode and not self.freeze_vision_encoder
+        self.get_vlm_model().vision_model.train(train_shared_vision)
+        self.get_vlm_model().connector.train(train_shared_vision)
         return self
 
     def _get_action_layer(self, layer_idx: int) -> nn.Module:

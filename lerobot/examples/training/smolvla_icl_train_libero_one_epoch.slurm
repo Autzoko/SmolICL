@@ -25,6 +25,7 @@ NUM_GPUS="${NUM_GPUS:-8}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 LOCAL_VISION_BATCH_SIZE="${LOCAL_VISION_BATCH_SIZE:-8}"
+FREEZE_VISION_ENCODER="${FREEZE_VISION_ENCODER:-false}"
 # 当前 v2 manifest 的 train/query 共有 109662 帧。ceil(109662 / (8*2)) = 6854，
 # 最后一个分布式 batch 只含少量 sampler padding；不会开始第二个数据 epoch。
 TRAIN_STEPS="${TRAIN_STEPS:-6854}"
@@ -91,7 +92,7 @@ torchrun --standalone --nproc-per-node="${NUM_GPUS}" -m lerobot.scripts.lerobot_
   --policy.push_to_hub=false \
   --policy.n_action_steps=5 \
   --policy.vlm_load_dtype=float32 \
-  --policy.freeze_vision_encoder=false \
+  --policy.freeze_vision_encoder="${FREEZE_VISION_ENCODER}" \
   --policy.local_vision_encode_batch_size="${LOCAL_VISION_BATCH_SIZE}" \
   --policy.local_vision_gradient_checkpointing=true \
   --policy.data_manifest_path="${ARTIFACT_ROOT}/manifest.json" \

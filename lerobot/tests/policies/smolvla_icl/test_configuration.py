@@ -11,8 +11,15 @@ def test_smolvla_icl_defaults_target_v100_training() -> None:
 
     # V100 用 FP32 保存可训练参数，实际矩阵计算由训练入口的 FP16 AMP 完成。
     assert config.vlm_load_dtype == "float32"
+    assert not config.freeze_vision_encoder
     assert config.local_vision_encode_batch_size == 2
     assert config.local_vision_gradient_checkpointing
+
+
+def test_smolvla_icl_can_freeze_shared_siglip() -> None:
+    config = SmolVLAICLConfig(freeze_vision_encoder=True)
+
+    assert config.freeze_vision_encoder
 
 
 def test_vlm_load_dtype_rejects_unknown_value() -> None:

@@ -334,14 +334,17 @@ class SmolVLAICLConfig(SmolVLAConfig):
     # FP16 参数带来的数值精度损失。A100/H100 可显式改回 ``bfloat16``。
     vlm_load_dtype: str = "float32"
 
-    # Query RGB 和 Local Demo RGB 共享这一套可训练视觉编码器。
-    # Matcher 使用另一份冻结 snapshot，不受该开关影响。
+    # Query RGB 和 Local Demo RGB 始终共享同一套 SigLIP+connector。
+    # False：两条视觉路径都参与 Action Loss 反传；True：两条路径都只做
+    # 冻结前向，但 Local Encoder 及后续模块仍正常训练。Matcher 始终使用
+    # 另一份冻结 snapshot，因此不受该开关影响，也无需重建 pairing sidecar。
     freeze_vision_encoder: bool = False
 
     # Local Demo 一次最多送入视觉编码器的帧数。Local Chunk 的语义窗口
     # 保持不变，只在 GPU 上按小批次编码，避免 B*T 张图同时展开。
     local_vision_encode_batch_size: int = 2
-    # 训练时重算视觉前向以换取更低的激活显存；rollout/no_grad 不启用。
+    # 训练可学习视觉编码器时重算前向以降低激活显存；视觉冻结、rollout
+    # 或外层 no_grad 时自动跳过，避免没有反向收益的重复计算。
     local_vision_gradient_checkpointing: bool = True
 
     # 训练数据只保存 demo_id/query_anchor/local_anchor；该目录只保存

@@ -26,6 +26,9 @@ NUM_WORKERS="${NUM_WORKERS:-2}"
 NUM_GPUS="${NUM_GPUS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 LOCAL_VISION_BATCH_SIZE="${LOCAL_VISION_BATCH_SIZE:-2}"
+# false：训练 Query/Local 共享 SigLIP；true：冻结视觉路径并自动跳过
+# Local vision checkpoint。Matcher snapshot 始终冻结，不受此变量影响。
+FREEZE_VISION_ENCODER="${FREEZE_VISION_ENCODER:-false}"
 
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
   echo "This smoke test must be submitted with sbatch." >&2
@@ -78,7 +81,7 @@ fi
 
 # V100 没有原生 BF16，因此参数以 FP32 保存、训练计算使用 FP16 AMP。
 # Local Demo 的 48 帧仍保留在 CPU，仅按两帧 microbatch 上传 GPU；这里不缓存
-# visual token，确保 Action Loss 能反向更新 Query/Local 共享的视觉编码器。
+# visual token。是否让 Action Loss 更新共享视觉编码器由上方开关控制。
 "${launcher[@]}" \
   --dataset.repo_id=lerobot/libero \
   --dataset.root="${DATASET_ROOT}" \
@@ -92,7 +95,7 @@ fi
   --policy.push_to_hub=false \
   --policy.n_action_steps=5 \
   --policy.vlm_load_dtype=float32 \
-  --policy.freeze_vision_encoder=false \
+  --policy.freeze_vision_encoder="${FREEZE_VISION_ENCODER}" \
   --policy.local_vision_encode_batch_size="${LOCAL_VISION_BATCH_SIZE}" \
   --policy.local_vision_gradient_checkpointing=true \
   --policy.data_manifest_path="${ARTIFACT_ROOT}/manifest.json" \

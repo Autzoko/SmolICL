@@ -323,12 +323,17 @@ class VLAFlowMatchingICL(nn.Module):
         visual_tokens = self.vlm_with_expert.embed_image(images)
         return self.local_encoder.pool_spatial_tokens(visual_tokens)
 
+    def _prepare_and_encode_local_images(self, raw_images: Tensor) -> Tensor:
+        """预处理图像并执行共享 SigLIP+connector，不进入 Local Encoder。"""
+        images = self._prepare_local_vision_images(raw_images)
+        return self.vlm_with_expert.embed_image(images)
+
     def _prepare_encode_and_pool_local_images(self, raw_images: Tensor) -> Tensor:
         """在同一 checkpoint 单元内完成图像展开、编码与池化。"""
         return self._encode_and_pool_local_images(self._prepare_local_vision_images(raw_images))
 
     def encode_local_demo(self, demo: LocalDemoBatch) -> LocalEncoderOutput:
-        """从 CPU 逐批上传 RGB，并用共享 ``E_vision`` 保持可训练编码。"""
+        """从 CPU 逐批上传 RGB，并按配置训练或冻结共享 ``E_vision``。"""
         batch_size, chunk_length = demo.images.shape[:2]
         flat_images = demo.images.flatten(0, 1)
         if flat_images.device.type != "cpu" or flat_images.dtype != torch.uint8:
@@ -337,12 +342,18 @@ class VLAFlowMatchingICL(nn.Module):
         # 使用连续 view 保留 DataLoader 的 pinned storage，确保 non_blocking
         # H2D 不会因离散 CPU index_select 产生的新内存而退化为同步拷贝。
         # 边界 padding 帧也随所在 micro-batch 编码，随后在视觉输出处清零；
-        # checkpoint 单元一直覆盖到 spatial pooling，因此 backward 前无需
-        # 保留每帧的 SigLIP 中间激活或完整 spatial token 序列。
+        # 可训练模式下，checkpoint 单元一直覆盖到 spatial pooling，因此
+        # backward 前无需保留每帧的 SigLIP 中间激活或完整 spatial token。
+        # 冻结模式不为 SigLIP+connector 建立计算图；spatial pooling 仍属于
+        # 可训练 Local Encoder，所以不会改变其输入、输出或后续梯度链路。
         model_device = demo.state_features.device
         visual_batches: list[Tensor] = []
+        train_vision_encoder = not self.config.freeze_vision_encoder
         use_checkpoint = (
-            self.training and torch.is_grad_enabled() and self.config.local_vision_gradient_checkpointing
+            train_vision_encoder
+            and self.training
+            and torch.is_grad_enabled()
+            and self.config.local_vision_gradient_checkpointing
         )
         encode_batch_size = self.config.local_vision_encode_batch_size
         for start in range(0, len(flat_images), encode_batch_size):
@@ -359,8 +370,15 @@ class VLAFlowMatchingICL(nn.Module):
                     image_batch,
                     use_reentrant=False,
                 )
-            else:
+            elif train_vision_encoder:
                 visual_hidden = self._prepare_encode_and_pool_local_images(image_batch)
+            else:
+                # 视觉冻结时显式关闭 autograd，避免为 48 帧 Local RGB 保存
+                # 无用激活。作用域只覆盖 SigLIP+connector；spatial pooling
+                # 和下方 Local Encoder 均在普通梯度上下文中执行并正常更新。
+                with torch.no_grad():
+                    visual_tokens = self._prepare_and_encode_local_images(image_batch)
+                visual_hidden = self.local_encoder.pool_spatial_tokens(visual_tokens)
             visual_batches.append(visual_hidden)
 
         flat_hidden = torch.cat(visual_batches, dim=0)
@@ -701,7 +719,6 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
         并让其中的标量 gate 一同训练和保存。
         """
         modules = [
-            "model.vlm_with_expert.vlm.model.connector",
             "model.global_encoder.state_encoder",
             "model.global_encoder.rgb_state_fusion",
             "model.global_encoder.temporal_aggregator",
@@ -709,6 +726,11 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
             "model.global_encoder.output_projection",
             "model.local_encoder",
         ]
+        # PEFT 的 modules_to_save 会把模块设为可训练；只有显式选择训练
+        # SigLIP 时才加入 connector，防止 freeze_vision_encoder=True 被
+        # PEFT 静默绕过。冻结的 connector 由基础 checkpoint 直接提供。
+        if not self.config.freeze_vision_encoder:
+            modules.insert(0, "model.vlm_with_expert.vlm.model.connector")
         modules.extend(
             f"model.vlm_with_expert.demo_expert.layers.{layer_idx}"
             for layer_idx in range(self.config.num_vlm_layers)
@@ -725,12 +747,13 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
     def _get_default_peft_targets(self) -> dict[str, Any]:
         """在 SmolVLA LoRA 目标上补充需要完整训练的 ICL 模块。"""
         targets = super()._get_default_peft_targets()
-        # PEFT 会先冻结全部 base parameters，因此需要显式将 SigLIP
-        # attention 投影加入 LoRA 目标。Connector 规模较小，保持完整训练。
-        targets["target_modules"] = (
-            rf"({targets['target_modules']}|"
-            r"model\.vlm_with_expert\.vlm\.model\.vision_model\..*\.(q|v)_proj)"
-        )
+        # PEFT 会先冻结全部 base parameters。仅在视觉可训练模式下为
+        # SigLIP attention 注入 LoRA；connector 则由 modules_to_save 完整训练。
+        if not self.config.freeze_vision_encoder:
+            targets["target_modules"] = (
+                rf"({targets['target_modules']}|"
+                r"model\.vlm_with_expert\.vlm\.model\.vision_model\..*\.(q|v)_proj)"
+            )
         targets["modules_to_save"] = self._icl_modules_to_save()
         return targets
 
@@ -1081,7 +1104,8 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
         model_device = batch[OBS_STATE].device
         global_demo = global_demo.to(model_device, non_blocking=True)
         # Local RGB 保留为 CPU uint8；仅 State/时间/mask 等轻量字段进入 GPU。
-        # encode_local_demo 会逐个上传视觉 micro-batch，并保留完整梯度链路。
+        # encode_local_demo 逐个上传视觉 micro-batch：视觉可训练时保留梯度，
+        # 冻结时只关闭 SigLIP 路径的 autograd，不影响后续 Local Encoder。
         local_demo = local_demo.to(model_device, non_blocking=True)
         images, image_masks = self.prepare_images(batch)
         losses = self.model(

@@ -1,10 +1,12 @@
 """Local Demo Encoder 的独立形状、Mask 和梯度测试。"""
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
 
+from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.smolvla_icl.components.demo_alignment import DemoEmbeddingCache
 from lerobot.policies.smolvla_icl.components.local_encoder import LocalDemoEncoder
 from lerobot.policies.smolvla_icl.configuration_smolvla_icl import (
@@ -14,7 +16,8 @@ from lerobot.policies.smolvla_icl.configuration_smolvla_icl import (
 from lerobot.policies.smolvla_icl.data.collate import build_encoded_local_demo_batch
 from lerobot.policies.smolvla_icl.data.state import DemoStateNormalizer
 from lerobot.policies.smolvla_icl.data.types import LocalDemoBatch
-from lerobot.policies.smolvla_icl.modeling_smolvla_icl import VLAFlowMatchingICL
+from lerobot.policies.smolvla_icl.modeling_smolvla_icl import SmolVLAICLPolicy, VLAFlowMatchingICL
+from lerobot.policies.smolvla_icl.smolvla_with_demo_expert import SmolVLMWithDemoExpertModel
 
 
 def make_config() -> LocalEncoderConfig:
@@ -160,6 +163,16 @@ class TinyVisionModel(nn.Module):
         return self.connector(torch.stack((pixels, pixels.square()), dim=1))
 
 
+class TinyVLM(nn.Module):
+    """只提供视觉前端，用于验证 ICL 对官方冻结逻辑的最终覆盖。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = nn.Module()
+        self.model.vision_model = nn.Linear(4, 4)
+        self.model.connector = nn.Linear(4, 4)
+
+
 def test_local_rgb_microbatches_preserve_shared_vision_gradients() -> None:
     """CPU uint8 RGB 应分批编码，且 Action 侧损失仍能更新共享视觉参数。"""
     encoder_config = LocalEncoderConfig(
@@ -174,6 +187,7 @@ def test_local_rgb_microbatches_preserve_shared_vision_gradients() -> None:
     nn.Module.__init__(model)
     model.config = SimpleNamespace(
         resize_imgs_with_padding=None,
+        freeze_vision_encoder=False,
         local_vision_encode_batch_size=2,
         local_vision_gradient_checkpointing=True,
         local_encoder=encoder_config,
@@ -201,3 +215,88 @@ def test_local_rgb_microbatches_preserve_shared_vision_gradients() -> None:
     assert max(model.vlm_with_expert.batch_sizes) <= 2
     assert model.vlm_with_expert.connector.weight.grad is not None
     assert torch.count_nonzero(model.vlm_with_expert.connector.weight.grad) > 0
+
+
+def test_frozen_local_vision_skips_graph_but_trains_local_encoder() -> None:
+    """冻结 SigLIP 时不保存视觉图，但 Local Encoder 仍接收 Action 侧梯度。"""
+    encoder_config = LocalEncoderConfig(
+        visual_feature_dim=4,
+        state_dim=2,
+        visual_projection_dim=4,
+        state_projection_dim=4,
+        output_dim=6,
+        temporal_embedding_dim=4,
+    )
+    model = VLAFlowMatchingICL.__new__(VLAFlowMatchingICL)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        resize_imgs_with_padding=None,
+        freeze_vision_encoder=True,
+        local_vision_encode_batch_size=2,
+        # 即使配置仍为 True，冻结模式也必须自动跳过视觉 checkpoint。
+        local_vision_gradient_checkpointing=True,
+        local_encoder=encoder_config,
+    )
+    model.vlm_with_expert = TinyVisionModel()
+    model.vlm_with_expert.requires_grad_(False)
+    model.local_encoder = LocalDemoEncoder(encoder_config)
+    model.train()
+
+    demo = LocalDemoBatch(
+        images=torch.randint(0, 256, (1, 5, 3, 6, 6), dtype=torch.uint8),
+        state_features=torch.randn(1, 5, 4),
+        relative_time_s=torch.linspace(-0.2, 0.2, 5).unsqueeze(0),
+        relative_position=torch.linspace(-0.4, 0.4, 5).unsqueeze(0),
+        phase=torch.linspace(0.1, 0.5, 5).unsqueeze(0),
+        valid_mask=torch.ones(1, 5, dtype=torch.bool),
+        anchor_positions=torch.tensor([2]),
+    )
+
+    output = model.encode_local_demo(demo)
+    output.local_tokens.square().mean().backward()
+
+    assert model.vlm_with_expert.connector.weight.grad is None
+    projection_weight = model.local_encoder.visual_projection[0].weight
+    assert projection_weight.grad is not None
+    assert torch.count_nonzero(projection_weight.grad) > 0
+
+
+def test_freeze_shared_siglip_is_respected_by_default_peft_targets() -> None:
+    """PEFT 不得用 LoRA 或 modules_to_save 绕过视觉冻结开关。"""
+    policy = SmolVLAICLPolicy.__new__(SmolVLAICLPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(freeze_vision_encoder=True, num_vlm_layers=16)
+
+    frozen_targets = policy._get_default_peft_targets()
+
+    assert "vision_model" not in frozen_targets["target_modules"]
+    assert all("connector" not in module for module in frozen_targets["modules_to_save"])
+
+    policy.config.freeze_vision_encoder = False
+    trainable_targets = policy._get_default_peft_targets()
+
+    assert "vision_model" in trainable_targets["target_modules"]
+    assert any("connector" in module for module in trainable_targets["modules_to_save"])
+
+
+def test_freeze_shared_vision_also_freezes_connector_outside_expert_only_mode() -> None:
+    """即使官方全 VLM 训练逻辑保留 connector，ICL 也必须将其重新冻结。"""
+    model = SmolVLMWithDemoExpertModel.__new__(SmolVLMWithDemoExpertModel)
+    nn.Module.__init__(model)
+    model.vlm = TinyVLM()
+    model.freeze_vision_encoder = True
+    model.train_expert_only = False
+
+    # 模拟官方 ``train_expert_only=False`` 执行完毕后的状态：connector 以及
+    # 其他未命中的 VLM 参数仍然可训练。ICL override 必须建立最终后置条件。
+    with patch.object(SmolVLMWithExpertModel, "set_requires_grad", return_value=None):
+        model.set_requires_grad()
+
+    vision_parameters = model.get_vlm_model().vision_model.parameters()
+    connector_parameters = model.get_vlm_model().connector.parameters()
+    assert all(not parameter.requires_grad for parameter in vision_parameters)
+    assert all(not parameter.requires_grad for parameter in connector_parameters)
+
+    model.train()
+    assert not model.get_vlm_model().vision_model.training
+    assert not model.get_vlm_model().connector.training
