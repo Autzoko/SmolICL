@@ -139,6 +139,88 @@ def _preprocess_dataset_batch(
     return preprocessor(batch)
 
 
+def _smolvla_icl_gradient_group(parameter_name: str) -> str:
+    """Map SmolVLA-ICL parameters to the trainable path they belong to."""
+    if ".vlm.model.vision_model." in parameter_name or ".vlm.model.connector." in parameter_name:
+        return "shared_vision"
+    if ".global_encoder." in parameter_name:
+        return "global_encoder"
+    if ".local_encoder." in parameter_name:
+        return "local_encoder"
+    if ".demo_expert." in parameter_name:
+        return "demo_expert"
+    if ".prefix_from_global." in parameter_name:
+        return "global_cross_attention"
+    if ".action_from_local." in parameter_name:
+        return "local_cross_attention"
+    if ".lm_expert." in parameter_name or any(
+        marker in parameter_name
+        for marker in (".state_proj.", ".action_in_proj.", ".action_out_proj.", ".action_time_mlp_")
+    ):
+        return "action_path"
+    return "other"
+
+
+def _log_smolvla_icl_gradient_audit(policy: PreTrainedPolicy) -> None:
+    """Log whether every SmolVLA-ICL trainable branch received finite gradients.
+
+    该审计只在显式请求的前若干步运行。它在梯度裁剪之后、optimizer step 之前读取
+    gradient，因此不会改变计算图，也不会长期增加训练开销。
+    """
+    stats: dict[str, dict[str, Any]] = {}
+    for name, parameter in policy.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        group = _smolvla_icl_gradient_group(name)
+        group_stats = stats.setdefault(
+            group,
+            {
+                "trainable_parameters": 0,
+                "gradient_parameters": 0,
+                "squared_norm": None,
+                "max_abs": None,
+                "all_finite": None,
+            },
+        )
+        group_stats["trainable_parameters"] += parameter.numel()
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        group_stats["gradient_parameters"] += parameter.numel()
+        gradient = gradient.detach()
+        squared_norm = gradient.float().square().sum()
+        max_abs = gradient.float().abs().max()
+        all_finite = torch.isfinite(gradient).all()
+        group_stats["squared_norm"] = (
+            squared_norm
+            if group_stats["squared_norm"] is None
+            else group_stats["squared_norm"] + squared_norm
+        )
+        group_stats["max_abs"] = (
+            max_abs if group_stats["max_abs"] is None else torch.maximum(group_stats["max_abs"], max_abs)
+        )
+        group_stats["all_finite"] = (
+            all_finite
+            if group_stats["all_finite"] is None
+            else torch.logical_and(group_stats["all_finite"], all_finite)
+        )
+
+    for group, group_stats in sorted(stats.items()):
+        squared_norm = group_stats["squared_norm"]
+        gradient_norm = squared_norm.sqrt().item() if squared_norm is not None else 0.0
+        max_abs = group_stats["max_abs"].item() if group_stats["max_abs"] is not None else 0.0
+        all_finite = bool(group_stats["all_finite"].item()) if group_stats["all_finite"] is not None else False
+        logging.info(
+            "gradient_audit group=%s gradient_parameters=%d/%d finite=%s norm=%.6g max_abs=%.6g",
+            group,
+            group_stats["gradient_parameters"],
+            group_stats["trainable_parameters"],
+            all_finite,
+            gradient_norm,
+            max_abs,
+        )
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -149,6 +231,7 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     sample_weighter=None,
+    audit_gradients: bool = False,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -170,6 +253,8 @@ def update_policy(
             Defaults to None.
         sample_weighter (SampleWeighter | None, optional): Optional SampleWeighter instance for
             per-sample loss weighting. Defaults to None.
+        audit_gradients (bool, optional): Whether to report SmolVLA-ICL branch-level gradients for
+            this step. Defaults to False.
 
     Returns:
         tuple[MetricsTracker, dict | None]: The updated MetricsTracker with new statistics for this
@@ -226,6 +311,11 @@ def update_policy(
         grad_norm = None
         if accelerator.sync_gradients and grad_clip_norm > 0:
             grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+
+        if audit_gradients and accelerator.sync_gradients and is_main_process():
+            unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+            if getattr(unwrapped_policy.config, "type", None) == "smolvla_icl":
+                _log_smolvla_icl_gradient_audit(unwrapped_policy)
 
         # Optimizer step (a no-op on non-final micro-batches under gradient accumulation)
         with lock if lock is not None else nullcontext():
@@ -803,6 +893,7 @@ def train(cfg: TrainPipelineConfig):
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
+            audit_gradients=step < cfg.gradient_audit_steps,
         )
         train_tracker.step_s = time.perf_counter() - step_start
 
@@ -847,19 +938,27 @@ def train(cfg: TrainPipelineConfig):
 
         if is_eval_step:
             policy.eval()
-            eval_loss_sum = 0.0
-            n_eval_batches = 0
+            # Accumulate a sample-weighted sum locally, then reduce sum and count together.
+            # This remains exact when the last batch sizes differ between data-parallel ranks.
+            eval_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+            n_eval_samples = torch.zeros((), device=device, dtype=torch.float64)
             with torch.no_grad(), accelerator.autocast():
                 for eval_batch in eval_dataloader:
                     eval_batch = _preprocess_dataset_batch(
                         eval_batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor
                     )
                     loss, _ = policy(eval_batch)  # __call__, so FSDP2 forward hooks run
-                    eval_loss_sum += loss.item()
-                    n_eval_batches += 1
-            eval_loss = eval_loss_sum / max(n_eval_batches, 1)
-            eval_loss = torch.tensor(eval_loss, device=device)
-            eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
+                    eval_batch_size = next(
+                        value.shape[0]
+                        for value in eval_batch.values()
+                        if isinstance(value, torch.Tensor) and value.ndim > 0
+                    )
+                    eval_loss_sum += loss.detach().to(dtype=torch.float64) * eval_batch_size
+                    n_eval_samples += eval_batch_size
+            eval_totals = accelerator.reduce(
+                torch.stack((eval_loss_sum, n_eval_samples)), reduction="sum"
+            )
+            eval_loss = (eval_totals[0] / eval_totals[1].clamp_min(1)).item()
             policy.train()
 
             if is_main_process():

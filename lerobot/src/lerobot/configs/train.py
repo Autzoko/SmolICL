@@ -143,6 +143,9 @@ class TrainPipelineConfig(HubMixin):
     # Run policy in the simulation environment every N steps to measure reward/success (0 = disabled).
     env_eval_freq: int = 20_000
     log_freq: int = 200
+    # Audit gradients for the first N training steps (0 = disabled). This is intended for
+    # short integration runs; scanning every gradient tensor has a measurable cost.
+    gradient_audit_steps: int = 0
     # Compute eval loss on held-out episodes every N steps (0 = disabled). Requires eval_split > 0.
     eval_steps: int = 0
     # Cap on total eval samples, split uniformly across tasks (0 = use all held-out data).
@@ -264,6 +267,9 @@ class TrainPipelineConfig(HubMixin):
             self.reward_model.pretrained_path = str(policy_dir)
 
     def validate(self) -> None:
+        if self.gradient_audit_steps < 0:
+            raise ValueError("`gradient_audit_steps` must be non-negative.")
+
         available_contexts = multiprocessing.get_all_start_methods()
         if (
             self.dataloader_multiprocessing_context is not None
