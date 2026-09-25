@@ -301,6 +301,11 @@ class SmolVLMWithDemoExpertModel(SmolVLMWithExpertModel):
             demo_layer.to(device=reference_weight.device, dtype=reference_weight.dtype)
         final_reference = self.lm_expert.norm.weight
         self.demo_expert.norm.to(device=final_reference.device, dtype=final_reference.dtype)
+        # Action Loss 在每层直接读取 G/L，并不消费 Transformer 最后返回的
+        # Demo hidden；因此 final norm 只服务调试输出，没有可训练的下游路径。
+        # 显式冻结这 720 个参数，避免把结构占位误报为断开的训练参数。
+        for parameter in self.demo_expert.norm.parameters():
+            parameter.requires_grad_(False)
 
         cross_layer_indices = range(1, self.num_vlm_layers, 2)
 

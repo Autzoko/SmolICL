@@ -708,7 +708,6 @@ class SmolVLAICLPolicy(SmolVLAPolicy):
             "model.global_encoder.task_query_bank",
             "model.global_encoder.output_projection",
             "model.local_encoder",
-            "model.vlm_with_expert.demo_expert.norm",
         ]
         modules.extend(
             f"model.vlm_with_expert.demo_expert.layers.{layer_idx}"
